@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Command line | Dispatch</title>
+<meta name="description" content="dispatch-run runs Dispatch collections, load tests and mock servers from the command line and in CI.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#FFF9F2" media="(prefers-color-scheme: light)"><meta name="theme-color" content="#1A1226" media="(prefers-color-scheme: dark)">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; img-src 'self' data:; style-src 'self'; font-src 'self'; base-uri 'self'; form-action 'none'">
+<link rel="canonical" href="https://dispatch.onelifestack.com/cli/">
+<link rel="manifest" href="/site.webmanifest">
+<link rel="icon" href="/assets/icon.svg" type="image/svg+xml"><link rel="icon" href="/assets/icon-32.png" sizes="32x32" type="image/png"><link rel="apple-touch-icon" href="/assets/icon-180.png">
+<link rel="preload" href="/assets/fonts/nunito-400.woff2" as="font" type="font/woff2" crossorigin><link rel="preload" href="/assets/fonts/nunito-800.woff2" as="font" type="font/woff2" crossorigin>
+<meta property="og:type" content="website"><meta property="og:site_name" content="Dispatch"><meta property="og:title" content="Command line | Dispatch">
+<meta property="og:description" content="dispatch-run runs Dispatch collections, load tests and mock servers from the command line and in CI."><meta property="og:url" content="https://dispatch.onelifestack.com/cli/"><meta property="og:image" content="https://dispatch.onelifestack.com/assets/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="/assets/site.css">
+<script src="/assets/site.js" defer></script>
+</head><body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site"><div class="wrap"><a class="brand" href="/"><img src="/assets/icon-32.png" width="32" height="32" alt="">Dispatch</a>
+<nav class="main" aria-label="Main"><a href="/#features">Features</a><a href="/download/">Download</a><a href="/cli/" aria-current="page">CLI</a><a href="/changelog/">Changelog</a><a href="/support/">Support</a><a href="/app/">Web app</a></nav></div></header>
+<main id="main">
+<div class="article"><div class="wrap"><p class="crumbs"><a href="/">Home</a> / Command line</p><h1>Command line</h1>
+<p class="lead"><code>dispatch-run</code> runs your Dispatch collections without the app, for CI, scripts and load checks. It uses the same code as the app.</p>
+<p><a class="btn primary" href="/downloads/dispatch-run.mjs" download>Download dispatch-run.mjs</a><code class="hash">SHA-256 2e2ac96698fcca3cebb5ac8308e3433525ab298f54fa9ba636a2821d70567c9f</code></p>
+<p>It is one file and needs Node.js 20 or newer. No install step, no dependencies to fetch.</p>
+<h2>Run a collection</h2>
+<pre><code>node dispatch-run.mjs demo-shop.postman_collection.json -d users.csv --junit report.xml</code></pre>
+<p>It accepts a Dispatch backup, a Postman collection, or a collection folder of YAML files written by the desktop app. Requests run in order with their scripts and tests, once per row of the data file. The exit code is non-zero when a test fails, so a CI job fails with it.</p>
+<h2>Options</h2>
+<div class="table-wrap"><table><thead><tr><th scope="col">Option</th><th scope="col">What it does</th></tr></thead><tbody>
+<tr><td><code>-c, --collection</code></td><td>Collection to run (default: the only or first one)</td></tr>
+<tr><td><code>-f, --folder</code></td><td>Folder to run, like <code>Parent/Child</code>. Repeat to run a suite</td></tr>
+<tr><td><code>-e, --environment</code></td><td>Environment file, or a name inside the file</td></tr>
+<tr><td><code>--env-var key=value</code></td><td>Set a variable. It wins over the environment</td></tr>
+<tr><td><code>-d, --data</code></td><td>CSV or JSON data file, one iteration per row</td></tr>
+<tr><td><code>-n, --iterations</code></td><td>Number of iterations</td></tr>
+<tr><td><code>--delay</code>, <code>--timeout</code></td><td>Wait between requests, and per-request timeout, in milliseconds</td></tr>
+<tr><td><code>--bail</code></td><td>Stop at the first failure</td></tr>
+<tr><td><code>-k, --insecure</code></td><td>Accept self-signed TLS certificates</td></tr>
+<tr><td><code>-r, --reporters</code></td><td><code>cli</code>, <code>json</code>, <code>junit</code> (with <code>--json</code> and <code>--junit</code> for the file paths)</td></tr>
+</tbody></table></div>
+<h2>Load test</h2>
+<pre><code>node dispatch-run.mjs load demo-shop.postman_collection.json --request Flaky \
+  --vus 20 --duration 30s --p95 800 --max-errors 1 --i-have-permission</code></pre>
+<p>Sends from virtual users and exits non-zero if a threshold is missed. <code>--i-have-permission</code> is required: use it only against servers you own or may test. Other options: <code>--loops</code>, <code>--ramp-up</code>, <code>--think</code>, <code>--min-rps</code>, <code>--samples</code> (write every sample as CSV).</p>
+<h2>Mock server</h2>
+<pre><code>node dispatch-run.mjs mock demo-shop.postman_collection.json</code></pre>
+<p>Serves the saved examples in a collection. Run <code>node dispatch-run.mjs --help</code> for every option.</p>
+<h2>In GitHub Actions</h2>
+<pre><code>- uses: actions/setup-node@v4
+  with: { node-version: 22 }
+- run: node dispatch-run.mjs api.collection.json -e staging.json --junit report.xml</code></pre></div></div>
+</main>
+<footer class="site"><div class="wrap">
+<div><a class="brand" href="/"><img src="/assets/icon-32.png" width="32" height="32" alt="">Dispatch</a>
+<p>A local-first API client. No account, no cloud, no telemetry.</p></div>
+<div><h2>Dispatch</h2><ul><li><a href="/#features">Features</a></li><li><a href="/download/">Download</a></li><li><a href="/cli/">Command line</a></li><li><a href="/app/">Open the web app</a></li><li><a href="/changelog/">Changelog</a></li></ul></div>
+<div><h2>Fine print</h2><ul><li><a href="/privacy/">Privacy policy</a></li><li><a href="/terms/">Terms of use</a></li><li><a href="/support/">Support</a></li><li><a href="mailto:hello@onelifestack.com">hello@onelifestack.com</a></li></ul></div>
+<small>&copy; 2026 OneLifeStack. Dispatch is part of <a href="https://onelifestack.com">OneLifeStack</a>. Other product and format names that appear on this site are used only to say what Dispatch can import or export; they belong to their owners, and Dispatch is independent of and not affiliated with them.</small>
+</div></footer></body></html>
