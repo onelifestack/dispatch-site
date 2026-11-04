@@ -22,7 +22,7 @@
 <main id="main">
 <div class="article"><div class="wrap"><p class="crumbs"><a href="/">Home</a> / Command line</p><h1>Command line</h1>
 <p class="lead"><code>dispatch-run</code> runs your Dispatch collections without the app, for CI, scripts and load checks. It uses the same code as the app.</p>
-<p><a class="btn primary" href="/downloads/dispatch-run.mjs" download>Download dispatch-run.mjs</a><code class="hash">SHA-256 2e2ac96698fcca3cebb5ac8308e3433525ab298f54fa9ba636a2821d70567c9f</code></p>
+<p><a class="btn primary" href="/downloads/dispatch-run.mjs" download>Download dispatch-run.mjs</a><code class="hash">SHA-256 9e9cd29d9df53e6b0a33d4867dc289d27b3ae3a0afb987edb63315a1fed45616</code></p>
 <p>It is one file and needs Node.js 20 or newer. No install step, no dependencies to fetch.</p>
 <h2>Run a collection</h2>
 <pre><code>node dispatch-run.mjs demo-shop.postman_collection.json -d users.csv --junit report.xml</code></pre>
@@ -47,6 +47,12 @@
 <h2>Mock server</h2>
 <pre><code>node dispatch-run.mjs mock demo-shop.postman_collection.json</code></pre>
 <p>Serves the saved examples in a collection. Run <code>node dispatch-run.mjs --help</code> for every option.</p>
+<h2>Flows</h2>
+<pre><code>node dispatch-run.mjs flow my-backup.json --flow "Checkout" -e staging.json</code></pre>
+<p>Runs a flow from a Dispatch backup or export, with the same blocks and branches as in the app. Browser login steps need Chrome or Edge on the machine.</p>
+<h2>Serve a collection to an AI assistant (MCP)</h2>
+<pre><code>claude mcp add dispatch -- node dispatch-run.mjs mcp ./my-collection -e staging.json --allow-methods GET,HEAD</code></pre>
+<p>An MCP server over stdio with three tools: <code>list_requests</code>, <code>send_request</code> and <code>run_collection</code>. Requests go through their auth, scripts and tests. <code>--allow-methods</code> limits what the assistant may send.</p>
 <h2>In GitHub Actions</h2>
 <pre><code>- uses: actions/setup-node@v4
   with: { node-version: 22 }

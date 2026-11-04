@@ -1,3 +1,0 @@
-class a{buf="";data=[];event="";id=null;retry=null;lastEventId=null;push(l){this.buf+=l;const h=[];let s;for(;(s=this.buf.search(/\r\n|\r|\n/))>=0;){const i=this.buf.slice(0,s);if(this.buf=this.buf.slice(s+(this.buf.startsWith(`\r
-`,s)?2:1)),i===""){this.data.length&&(h.push({event:this.event||"message",data:this.data.join(`
-`),id:this.id,retry:this.retry}),this.id!==null&&(this.lastEventId=this.id)),this.data=[],this.event="",this.retry=null;continue}if(i.startsWith(":"))continue;const e=i.indexOf(":"),n=e>=0?i.slice(0,e):i;let t=e>=0?i.slice(e+1):"";t.startsWith(" ")&&(t=t.slice(1)),n==="data"?this.data.push(t):n==="event"?this.event=t:n==="id"&&!t.includes("\0")?this.id=t:n==="retry"&&/^\d+$/.test(t)&&(this.retry=Number(t))}return h}}export{a as SseParser};

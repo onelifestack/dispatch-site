@@ -40,6 +40,755 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
   mod
 ));
 
+// src/core/cdp.ts
+var CdpError, Cdp, CdpPage;
+var init_cdp = __esm({
+  "src/core/cdp.ts"() {
+    "use strict";
+    CdpError = class extends Error {
+    };
+    Cdp = class _Cdp {
+      constructor(ws) {
+        this.ws = ws;
+        ws.onmessage = (ev) => {
+          const msg = JSON.parse(typeof ev.data === "string" ? ev.data : String(ev.data));
+          if (msg.id !== void 0) {
+            const w = this.waiting.get(msg.id);
+            this.waiting.delete(msg.id);
+            if (msg.error) w?.reject(new CdpError(msg.error.message));
+            else w?.resolve(msg.result);
+          } else this.listeners.forEach((l) => l(msg.method, msg.params, msg.sessionId));
+        };
+        ws.onclose = () => {
+          for (const w of this.waiting.values()) w.reject(new CdpError("The browser connection closed."));
+          this.waiting.clear();
+        };
+      }
+      next = 1;
+      waiting = /* @__PURE__ */ new Map();
+      listeners = /* @__PURE__ */ new Set();
+      static connect(wsUrl, timeoutMs = 1e4) {
+        return new Promise((resolve, reject) => {
+          const ws = new WebSocket(wsUrl);
+          const t = setTimeout(() => {
+            try {
+              ws.close();
+            } catch {
+            }
+            reject(new CdpError("Couldn\u2019t connect to the browser."));
+          }, timeoutMs);
+          ws.onopen = () => {
+            clearTimeout(t);
+            resolve(new _Cdp(ws));
+          };
+          ws.onerror = () => {
+            clearTimeout(t);
+            reject(new CdpError("Couldn\u2019t connect to the browser."));
+          };
+        });
+      }
+      send(method, params = {}, sessionId) {
+        const id = this.next++;
+        return new Promise((resolve, reject) => {
+          this.waiting.set(id, { resolve, reject });
+          this.ws.send(JSON.stringify({ id, method, params, ...sessionId ? { sessionId } : {} }));
+        });
+      }
+      on(fn) {
+        this.listeners.add(fn);
+        return () => this.listeners.delete(fn);
+      }
+      close() {
+        try {
+          this.ws.close();
+        } catch {
+        }
+      }
+    };
+    CdpPage = class _CdpPage {
+      constructor(cdp, sessionId) {
+        this.cdp = cdp;
+        this.sessionId = sessionId;
+      }
+      static async open(cdp) {
+        const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank" });
+        const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
+        const p = new _CdpPage(cdp, sessionId);
+        await Promise.all([p.send("Page.enable"), p.send("Runtime.enable"), p.send("Network.enable")]);
+        return p;
+      }
+      send(method, params = {}) {
+        return this.cdp.send(method, params, this.sessionId);
+      }
+      /** Runs an expression in the page and returns its (JSON-able) value. */
+      async evaluate(expression) {
+        const r = await this.send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
+        if (r.exceptionDetails) throw new CdpError(r.exceptionDetails.exception?.description?.split("\n")[0] ?? r.exceptionDetails.text);
+        return r.result.value;
+      }
+      /** Navigates and waits for the load event (or the timeout). */
+      async goto(url, timeoutMs) {
+        const loaded = new Promise((resolve) => {
+          const off = this.cdp.on((m, _p, sid) => {
+            if (sid === this.sessionId && m === "Page.loadEventFired") {
+              off();
+              resolve();
+            }
+          });
+          setTimeout(() => {
+            off();
+            resolve();
+          }, timeoutMs);
+        });
+        const r = await this.send("Page.navigate", { url });
+        if (r.errorText) throw new CdpError(`Couldn\u2019t open ${url}: ${r.errorText}`);
+        await loaded;
+      }
+      /** All cookies the browser has (including HttpOnly ones). */
+      async cookies() {
+        return (await this.send("Network.getAllCookies")).cookies;
+      }
+    };
+  }
+});
+
+// src/core/browser.ts
+async function runBrowserSteps(cfg, fill, launcher, signal) {
+  const out = { ok: false, error: null, steps: [], extracted: {}, cookies: [], logs: [], finalUrl: "" };
+  const log = (level, text) => out.logs.push({ level, text, at: Date.now(), source: "browser" });
+  let session = null;
+  let cdp = null;
+  try {
+    session = await launcher.launch({ path: cfg.browserPath, show: cfg.show });
+    cdp = await Cdp.connect(session.wsUrl);
+    const page = await CdpPage.open(cdp);
+    const deadline = (ms = cfg.timeoutMs) => Date.now() + ms;
+    const until = async (what, test2) => {
+      const end = deadline();
+      while (Date.now() < end) {
+        if (signal?.aborted) throw new CdpError("Stopped.");
+        if (await test2().catch(() => false)) return;
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      throw new CdpError(`Timed out waiting for ${what}.`);
+    };
+    const exists = (sel) => page.evaluate(`!!document.querySelector(${js(sel)})`);
+    for (const st of cfg.steps) {
+      if (signal?.aborted) throw new CdpError("Stopped.");
+      const t0 = Date.now();
+      const target = fill(st.target);
+      let note = "";
+      try {
+        switch (st.kind) {
+          case "goto":
+            await page.goto(target, cfg.timeoutMs);
+            note = target;
+            break;
+          case "fill": {
+            await until(target, () => exists(target));
+            const val = fill(st.value);
+            await page.evaluate(`(() => { const el = document.querySelector(${js(target)}); el.focus();
+              const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+              Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, ${js(val)});
+              el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+            note = `${target} \u2190 ${/pass|secret|token/i.test(st.target + st.value) ? "\u2022\u2022\u2022\u2022" : val}`;
+            break;
+          }
+          case "click":
+            await until(target, () => exists(target));
+            await page.evaluate(`document.querySelector(${js(target)}).click()`);
+            note = target;
+            break;
+          case "press":
+            await until(target, () => exists(target));
+            await page.evaluate(`(() => { const el = document.querySelector(${js(target)}); el.focus();
+              for (const type of ['keydown', 'keypress', 'keyup']) el.dispatchEvent(new KeyboardEvent(type, { key: ${js(st.value || "Enter")}, bubbles: true }));
+              if (${js(st.value || "Enter")} === 'Enter' && el.form) el.form.requestSubmit ? el.form.requestSubmit() : el.form.submit(); })()`);
+            note = `${st.value || "Enter"} in ${target}`;
+            break;
+          case "waitFor":
+            await until(target, () => exists(target));
+            note = target;
+            break;
+          case "waitUrl":
+            await until(`the address to contain \u201C${target}\u201D`, async () => (await page.evaluate("location.href")).includes(target));
+            note = target;
+            break;
+          case "wait":
+            await new Promise((r) => setTimeout(r, Math.min(6e4, Number(fill(st.value)) || 1e3)));
+            note = `${st.value} ms`;
+            break;
+          case "extractCookie": {
+            let found;
+            await until(`cookie \u201C${target}\u201D`, async () => {
+              found = (await page.cookies()).find((c2) => c2.name === target && (!st.option || c2.domain.endsWith(st.option)));
+              return !!found;
+            });
+            out.extracted[st.saveAs || target] = found.value;
+            note = `${target} \u2192 {{${st.saveAs || target}}}`;
+            break;
+          }
+          case "extractStorage": {
+            const area = st.option === "session" ? "sessionStorage" : "localStorage";
+            let v = null;
+            await until(`${area} \u201C${target}\u201D`, async () => {
+              v = await page.evaluate(`${area}.getItem(${js(target)})`);
+              return v !== null;
+            });
+            let value = v;
+            try {
+              const o = JSON.parse(value);
+              if (o && typeof o === "object") value = o.access_token ?? o.accessToken ?? o.token ?? o.id_token ?? value;
+            } catch {
+            }
+            out.extracted[st.saveAs || target] = value;
+            note = `${area}.${target} \u2192 {{${st.saveAs || target}}}`;
+            break;
+          }
+          case "extractText": {
+            await until(target, () => exists(target));
+            out.extracted[st.saveAs || "text"] = await page.evaluate(`document.querySelector(${js(target)}).textContent.trim()`) ?? "";
+            note = `${target} \u2192 {{${st.saveAs || "text"}}}`;
+            break;
+          }
+        }
+        out.steps.push({ id: st.id, kind: st.kind, ok: true, ms: Date.now() - t0, note });
+      } catch (e) {
+        const why = e instanceof Error ? e.message : String(e);
+        out.steps.push({ id: st.id, kind: st.kind, ok: false, ms: Date.now() - t0, note: why });
+        throw new CdpError(`Step ${out.steps.length} (${st.kind}) failed: ${why}`);
+      }
+    }
+    out.finalUrl = await page.evaluate("location.href").catch(() => "");
+    if (cfg.keepCookies) out.cookies = (await page.cookies()).map((c2) => ({ domain: c2.domain.replace(/^\./, ""), name: c2.name, value: c2.value, path: c2.path, secure: c2.secure, httpOnly: c2.httpOnly, expires: c2.expires }));
+    out.ok = true;
+    log("info", `Browser login done: ${Object.keys(out.extracted).join(", ") || "no values extracted"}${cfg.keepCookies ? `, ${out.cookies.length} cookies kept` : ""}.`);
+  } catch (e) {
+    out.error = e instanceof Error ? e.message : String(e);
+    log("error", out.error);
+  } finally {
+    cdp?.close();
+    await session?.close().catch(() => {
+    });
+  }
+  return out;
+}
+function storeExtracted(rows, extracted) {
+  const next = [...rows];
+  for (const [k, v] of Object.entries(extracted)) {
+    const i = next.findIndex((r) => r.key === k);
+    if (i >= 0) next[i] = { ...next[i], value: v, enabled: true };
+    else next.push({ id: uid(), key: k, value: v, enabled: true, secret: true });
+  }
+  return next;
+}
+var newStep, defaultBrowserConfig, js, BROWSER_CANDIDATES, browserArgs;
+var init_browser = __esm({
+  "src/core/browser.ts"() {
+    "use strict";
+    init_types();
+    init_cdp();
+    newStep = (kind, target = "", value = "", saveAs = "", option = "") => ({ id: uid(), kind, target, value, saveAs, option });
+    defaultBrowserConfig = () => ({
+      steps: [
+        newStep("goto", "{{baseUrl}}/login"),
+        newStep("fill", "input[name=username]", "{{username}}"),
+        newStep("fill", "input[type=password]", "{{password}}"),
+        newStep("click", "button[type=submit]"),
+        newStep("waitUrl", "/"),
+        newStep("extractCookie", "session", "", "sessionCookie")
+      ],
+      show: false,
+      browserPath: "",
+      timeoutMs: 3e4,
+      keepCookies: true
+    });
+    js = (v) => JSON.stringify(v);
+    BROWSER_CANDIDATES = {
+      linux: ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "microsoft-edge", "microsoft-edge-stable", "brave-browser"],
+      windows: [
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+        "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe"
+      ],
+      mac: ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge", "/Applications/Chromium.app/Contents/MacOS/Chromium"]
+    };
+    browserArgs = (profileDir, show, allowOrigin) => [
+      "--remote-debugging-port=0",
+      ...allowOrigin ? [`--remote-allow-origins=${allowOrigin}`] : [],
+      `--user-data-dir=${profileDir}`,
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-background-networking",
+      "--disable-sync",
+      "--password-store=basic",
+      ...show ? [] : ["--headless=new"],
+      "about:blank"
+    ];
+  }
+});
+
+// src/core/types.ts
+function uid() {
+  const c2 = globalThis.crypto;
+  if (c2?.randomUUID) return c2.randomUUID();
+  return `${Date.now().toString(36)}-${(counter++).toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+function newRequest(partial = {}) {
+  return normalizeRequest({ id: uid(), name: "New request", updatedAt: Date.now(), sort: Date.now(), ...partial });
+}
+function normalizeRequest(r) {
+  return {
+    name: "New request",
+    protocol: "http",
+    method: "GET",
+    url: "",
+    params: [],
+    pathVars: [],
+    headers: [],
+    docs: "",
+    examples: [],
+    collectionId: null,
+    folderId: null,
+    sort: 0,
+    updatedAt: Date.now(),
+    ...r,
+    body: { ...emptyBody(), ...r.body },
+    auth: { ...emptyAuth(), ...r.auth },
+    scripts: { ...emptyScripts(), ...r.scripts },
+    settings: { ...emptySettings(), ...r.settings },
+    ws: { messages: [], ...r.ws },
+    mqtt: { clientId: "", topics: [], publishTopic: "", payload: "", qos: 0, retain: false, ...r.mqtt },
+    grpc: { method: "", proto: "", useReflection: true, message: "{}", metadata: [], tls: false, ...r.grpc },
+    sio: { listen: "", emitEvent: "message", ...r.sio },
+    mcp: { transport: "http", command: "", env: [], cwd: "", tool: "", arguments: "{}", ...r.mcp },
+    browser: { ...defaultBrowserConfig(), ...r.browser }
+  };
+}
+function newCollection(name = "New collection") {
+  return normalizeCollection({ id: uid(), name });
+}
+function normalizeCollection(c2) {
+  return { name: "Collection", variables: [], docs: "", linkedDir: "", workspaceId: DEFAULT_SPACE.id, updatedAt: Date.now(), ...c2, auth: { ...emptyAuth("none"), ...c2.auth }, scripts: { ...emptyScripts(), ...c2.scripts } };
+}
+function newFolder(collectionId, name = "New folder", parentId = null) {
+  return normalizeFolder({ id: uid(), name, collectionId, parentId, sort: Date.now() });
+}
+function normalizeFolder(f) {
+  return { name: "Folder", parentId: null, docs: "", sort: 0, updatedAt: Date.now(), ...f, auth: { ...emptyAuth("inherit"), ...f.auth }, scripts: { ...emptyScripts(), ...f.scripts } };
+}
+function newEnvironment(name = "New environment") {
+  return { id: uid(), name, variables: [], updatedAt: Date.now() };
+}
+var METHODS, DEFAULT_SPACE, defaultSettings, counter, kv, emptyAuth, emptyBody, emptyScripts, emptySettings, bySort;
+var init_types = __esm({
+  "src/core/types.ts"() {
+    "use strict";
+    init_browser();
+    METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+    DEFAULT_SPACE = { id: "default", name: "My workspace" };
+    defaultSettings = {
+      activeEnvId: null,
+      theme: "system",
+      timeoutMs: 3e4,
+      followRedirects: true,
+      insecureTls: false,
+      cookieJar: true,
+      proxyUrl: "",
+      proxyBypass: "localhost, 127.0.0.1",
+      clientCerts: [],
+      caCerts: [],
+      activeSpaceId: "default",
+      spaceEnv: {}
+    };
+    counter = 0;
+    kv = (key = "", value = "", enabled = true, extra = {}) => ({ id: uid(), key, value, enabled, ...extra });
+    emptyAuth = (kind = "inherit") => ({
+      kind,
+      username: "",
+      password: "",
+      token: "",
+      key: "",
+      value: "",
+      in: "header",
+      grant: "client_credentials",
+      tokenUrl: "",
+      authUrl: "",
+      clientId: "",
+      clientSecret: "",
+      scope: "",
+      redirectUri: "http://127.0.0.1:45719/callback",
+      usePkce: true,
+      clientAuth: "header",
+      accessToken: "",
+      refreshToken: "",
+      expiresAt: 0,
+      algorithm: "HS256",
+      secret: "",
+      payload: '{\n  "sub": "1234"\n}',
+      headerPrefix: "Bearer",
+      accessKey: "",
+      secretKey: "",
+      sessionToken: "",
+      region: "us-east-1",
+      service: "execute-api"
+    });
+    emptyBody = (kind = "none") => ({ kind, text: "", fields: [], graphqlVariables: "", file: null });
+    emptyScripts = () => ({ pre: "", post: "" });
+    emptySettings = () => ({ timeoutMs: null, followRedirects: null, insecureTls: null });
+    bySort = (a, b) => a.sort - b.sort || a.name.localeCompare(b.name);
+  }
+});
+
+// src/core/url.ts
+function splitUrl(url) {
+  const h = url.indexOf("#");
+  const hash = h >= 0 ? url.slice(h) : "";
+  const rest = h >= 0 ? url.slice(0, h) : url;
+  const q = rest.indexOf("?");
+  return q >= 0 ? { base: rest.slice(0, q), query: rest.slice(q + 1), hash } : { base: rest, query: "", hash };
+}
+function decode(s) {
+  try {
+    return decodeURIComponent(s.replace(/\+/g, " "));
+  } catch {
+    return s;
+  }
+}
+function encodeComponent(s) {
+  return s.split(/(\{\{[^{}]*\}\})/).map((part, i) => i % 2 ? part : encodeURIComponent(part)).join("");
+}
+function parseQuery(query) {
+  if (!query) return [];
+  return query.split("&").filter(Boolean).map((pair) => {
+    const eq = pair.indexOf("=");
+    return eq >= 0 ? { key: decode(pair.slice(0, eq)), value: decode(pair.slice(eq + 1)) } : { key: decode(pair), value: "" };
+  });
+}
+function paramsFromUrl(url, existing) {
+  const pool = existing.filter((p) => p.enabled);
+  const enabled = parseQuery(splitUrl(url).query).map(({ key, value }) => {
+    const i = pool.findIndex((p) => p.key === key);
+    const reuse = i >= 0 ? pool.splice(i, 1)[0] : null;
+    return reuse ? { ...reuse, value } : kv(key, value);
+  });
+  return [...enabled, ...existing.filter((p) => !p.enabled)];
+}
+function withScheme(url) {
+  const t = url.trim();
+  if (!t || /^[a-z][a-z0-9+.-]*:\/\//i.test(t)) return t;
+  return (/^(localhost|127\.|\[::1\])/i.test(t) ? "http://" : "https://") + t;
+}
+function appendQuery(url, key, value) {
+  const { base, query, hash } = splitUrl(url);
+  const pair = `${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+  return `${base}?${query ? `${query}&` : ""}${pair}${hash}`;
+}
+var init_url = __esm({
+  "src/core/url.ts"() {
+    "use strict";
+    init_types();
+  }
+});
+
+// src/core/fake.ts
+var FIRST, LAST, WORDS, ADJ, VERBS, CITIES, COUNTRIES, STREETS, SUFFIX, COMPANY, JOB_LEVEL, JOB_AREA, JOB_TYPE, DEPARTMENTS, PRODUCTS, MATERIAL, CURRENCIES, LOCALES, MIME, EXT, TLD, COLORS, UA, int, pick, cap, hex, chars, ALNUM, plain, sentence, daysFromNow, domain, FAKE;
+var init_fake = __esm({
+  "src/core/fake.ts"() {
+    "use strict";
+    init_types();
+    FIRST = ["Aarav", "Maya", "Liam", "Zara", "Noah", "Ana", "Kenji", "Amara", "Lucas", "Priya", "Omar", "Elena", "Kofi", "Mei", "Ivan", "Sara", "Diego", "Nia", "Arjun", "Leila", "Tom\xE1s", "Hana", "Ravi", "Freya"];
+    LAST = ["Sharma", "Okafor", "Garc\xEDa", "Nguyen", "M\xFCller", "Kowalski", "Haddad", "Tanaka", "Silva", "Johansson", "Mensah", "Rossi", "Patel", "Kim", "Novak", "Dubois", "Ahmed", "Costa", "Ivanova", "Walker"];
+    WORDS = ["river", "lantern", "orbit", "maple", "signal", "harbor", "copper", "meadow", "pixel", "summit", "velvet", "canyon", "ember", "quartz", "willow", "beacon", "cobalt", "tundra", "fable", "nimbus"];
+    ADJ = ["quick", "quiet", "bright", "gentle", "brave", "clever", "calm", "eager", "fancy", "jolly", "lively", "proud", "silly", "witty", "tidy"];
+    VERBS = ["build", "carry", "draw", "fetch", "gather", "jump", "lift", "mend", "paint", "reach", "sail", "shape", "sort", "trace", "weave"];
+    CITIES = ["Pune", "Lagos", "Lisbon", "Osaka", "Toronto", "Nairobi", "Krak\xF3w", "Medell\xEDn", "Melbourne", "Tallinn", "Accra", "Hanoi", "Valencia", "Bergen"];
+    COUNTRIES = [["India", "IN"], ["Nigeria", "NG"], ["Portugal", "PT"], ["Japan", "JP"], ["Canada", "CA"], ["Kenya", "KE"], ["Poland", "PL"], ["Colombia", "CO"], ["Australia", "AU"], ["Estonia", "EE"], ["Ghana", "GH"], ["Vietnam", "VN"], ["Spain", "ES"], ["Norway", "NO"]];
+    STREETS = ["Oak", "Mill", "Station", "Harbor", "Church", "Park", "Garden", "Lake", "Hill", "Market"];
+    SUFFIX = ["Street", "Road", "Lane", "Avenue", "Way", "Close"];
+    COMPANY = ["Labs", "Works", "Systems", "Collective", "Studio", "Group", "Partners", "Co"];
+    JOB_LEVEL = ["Senior", "Lead", "Junior", "Principal", "Staff", "Associate"];
+    JOB_AREA = ["Data", "Platform", "Product", "Security", "Support", "Design", "Finance", "Research"];
+    JOB_TYPE = ["Engineer", "Analyst", "Designer", "Manager", "Consultant", "Specialist", "Architect"];
+    DEPARTMENTS = ["Books", "Garden", "Toys", "Music", "Outdoors", "Kitchen", "Health", "Tools", "Games", "Home"];
+    PRODUCTS = ["Chair", "Lamp", "Backpack", "Kettle", "Notebook", "Headphones", "Bottle", "Jacket", "Mug", "Desk"];
+    MATERIAL = ["Wooden", "Steel", "Cotton", "Ceramic", "Bamboo", "Leather", "Glass", "Recycled"];
+    CURRENCIES = ["USD", "EUR", "INR", "GBP", "JPY", "NGN", "BRL", "CAD", "AUD", "KES"];
+    LOCALES = ["en", "en-GB", "hi", "fr", "de", "es", "pt-BR", "ja", "ko", "sw", "pl"];
+    MIME = ["application/json", "text/plain", "image/png", "image/jpeg", "application/pdf", "text/csv", "application/zip"];
+    EXT = ["json", "txt", "png", "jpg", "pdf", "csv", "zip"];
+    TLD = ["com", "org", "net", "io", "dev", "test"];
+    COLORS = ["red", "orange", "yellow", "green", "teal", "blue", "indigo", "violet", "pink", "brown", "grey"];
+    UA = [
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+      "Mozilla/5.0 (Linux; Android 14; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36"
+    ];
+    int = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+    pick = (a) => a[int(0, a.length - 1)];
+    cap = (s) => s[0].toUpperCase() + s.slice(1);
+    hex = (n) => Array.from({ length: n }, () => int(0, 15).toString(16)).join("");
+    chars = (n, set2) => Array.from({ length: n }, () => set2[int(0, set2.length - 1)]).join("");
+    ALNUM = "abcdefghijklmnopqrstuvwxyz0123456789";
+    plain = (s) => s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+    sentence = () => {
+      const w = Array.from({ length: int(5, 10) }, () => pick([...WORDS, ...ADJ, ...VERBS]));
+      return `${cap(w.join(" "))}.`;
+    };
+    daysFromNow = (d) => new Date(Date.now() + d * 864e5).toISOString();
+    domain = () => `${pick(WORDS)}${pick(["", "-", ""])}${pick(WORDS)}.${pick(TLD)}`;
+    FAKE = {
+      $guid: () => uid(),
+      $uuid: () => uid(),
+      $randomUUID: () => uid(),
+      $timestamp: () => String(Math.floor(Date.now() / 1e3)),
+      $isoTimestamp: () => (/* @__PURE__ */ new Date()).toISOString(),
+      $randomInt: () => String(int(0, 1e3)),
+      $randomBoolean: () => String(Math.random() < 0.5),
+      $randomAlphaNumeric: () => chars(1, ALNUM),
+      $randomHexColor: () => `#${hex(6)}`,
+      $randomColor: () => pick(COLORS),
+      $randomAbbreviation: () => pick(["API", "SQL", "JSON", "HTTP", "TCP", "CSS", "XML", "SSL"]),
+      $randomFirstName: () => pick(FIRST),
+      $randomLastName: () => pick(LAST),
+      $randomFullName: () => `${pick(FIRST)} ${pick(LAST)}`,
+      $randomNamePrefix: () => pick(["Mr.", "Ms.", "Mx.", "Dr."]),
+      $randomUserName: () => `${plain(pick(FIRST))}${pick([".", "_", ""])}${plain(pick(LAST))}${int(1, 99)}`,
+      $randomEmail: () => `${plain(pick(FIRST))}.${plain(pick(LAST))}${int(1, 999)}@example.${pick(["com", "org", "net"])}`,
+      $randomExampleEmail: () => `${plain(pick(FIRST))}${int(1, 99)}@example.com`,
+      $randomPassword: () => chars(15, `${ALNUM}ABCDEFGHJKLMNPQRSTUVWXYZ!@#$%`),
+      $randomPhoneNumber: () => `+1-${int(200, 989)}-${int(200, 999)}-${String(int(0, 9999)).padStart(4, "0")}`,
+      $randomPhoneNumberExt: () => `+1-${int(200, 989)}-${int(200, 999)}-${String(int(0, 9999)).padStart(4, "0")} x${int(10, 999)}`,
+      $randomCity: () => pick(CITIES),
+      $randomCountry: () => pick(COUNTRIES)[0],
+      $randomCountryCode: () => pick(COUNTRIES)[1],
+      $randomStreetName: () => `${pick(STREETS)} ${pick(SUFFIX)}`,
+      $randomStreetAddress: () => `${int(1, 9999)} ${pick(STREETS)} ${pick(SUFFIX)}`,
+      $randomZipCode: () => String(int(1e4, 99999)),
+      $randomLatitude: () => (Math.random() * 180 - 90).toFixed(4),
+      $randomLongitude: () => (Math.random() * 360 - 180).toFixed(4),
+      $randomCompanyName: () => `${cap(pick(WORDS))} ${pick(COMPANY)}`,
+      $randomCatchPhrase: () => `${cap(pick(ADJ))} ${pick(WORDS)} for ${pick(WORDS)}s`,
+      $randomJobTitle: () => `${pick(JOB_LEVEL)} ${pick(JOB_AREA)} ${pick(JOB_TYPE)}`,
+      $randomJobArea: () => pick(JOB_AREA),
+      $randomJobType: () => pick(JOB_TYPE),
+      $randomDepartment: () => pick(DEPARTMENTS),
+      $randomProduct: () => pick(PRODUCTS),
+      $randomProductName: () => `${pick(ADJ) === "quick" ? "Handy" : cap(pick(ADJ))} ${pick(MATERIAL)} ${pick(PRODUCTS)}`,
+      $randomProductMaterial: () => pick(MATERIAL),
+      $randomPrice: () => (int(100, 99999) / 100).toFixed(2),
+      $randomCurrencyCode: () => pick(CURRENCIES),
+      $randomBankAccount: () => String(int(1e7, 99999999)),
+      $randomBankAccountIban: () => `GB${int(10, 99)}TEST${String(int(0, 99999999)).padStart(8, "0")}${String(int(0, 999999)).padStart(6, "0")}`,
+      $randomCreditCardMask: () => String(int(1e3, 9999)),
+      $randomWord: () => pick(WORDS),
+      $randomWords: () => Array.from({ length: int(2, 5) }, () => pick(WORDS)).join(" "),
+      $randomNoun: () => pick(WORDS),
+      $randomVerb: () => pick(VERBS),
+      $randomAdjective: () => pick(ADJ),
+      $randomLoremWord: () => pick(WORDS),
+      $randomLoremWords: () => Array.from({ length: 3 }, () => pick(WORDS)).join(" "),
+      $randomLoremSentence: sentence,
+      $randomLoremParagraph: () => Array.from({ length: int(3, 5) }, sentence).join(" "),
+      $randomLoremSlug: () => Array.from({ length: 3 }, () => pick(WORDS)).join("-"),
+      $randomDomainName: domain,
+      $randomDomainWord: () => pick(WORDS),
+      $randomUrl: () => `https://${domain()}/${pick(WORDS)}`,
+      $randomIP: () => `${int(1, 223)}.${int(0, 255)}.${int(0, 255)}.${int(1, 254)}`,
+      $randomIPV6: () => Array.from({ length: 8 }, () => hex(4)).join(":"),
+      $randomMACAddress: () => Array.from({ length: 6 }, () => hex(2)).join(":"),
+      $randomUserAgent: () => pick(UA),
+      $randomSemver: () => `${int(0, 9)}.${int(0, 20)}.${int(0, 30)}`,
+      $randomLocale: () => pick(LOCALES),
+      $randomMimeType: () => pick(MIME),
+      $randomFileName: () => `${pick(WORDS)}_${pick(WORDS)}.${pick(EXT)}`,
+      $randomFileExt: () => pick(EXT),
+      $randomDateFuture: () => daysFromNow(int(1, 365)),
+      $randomDatePast: () => daysFromNow(-int(1, 365)),
+      $randomDateRecent: () => daysFromNow(-Math.random() * 2),
+      $randomWeekday: () => pick(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]),
+      $randomMonth: () => pick(["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]),
+      $randomAvatarImage: () => `https://example.com/avatars/${int(1, 999)}.png`
+    };
+  }
+});
+
+// src/core/vars.ts
+function scopeOf(...layers) {
+  const m = /* @__PURE__ */ new Map();
+  for (const layer of layers) for (const v of layer ?? []) if (v.enabled && v.key.trim()) m.set(v.key.trim(), v.value);
+  return m;
+}
+function interpolate(text, scope2, unresolved) {
+  let out = text;
+  for (let depth = 0; depth < 5 && PATTERN.test(out); depth++) {
+    PATTERN.lastIndex = 0;
+    let changed = false;
+    out = out.replace(PATTERN, (whole, name) => {
+      if (scope2.has(name)) {
+        changed = true;
+        return scope2.get(name);
+      }
+      const dyn = DYNAMIC[name];
+      if (dyn) {
+        changed = true;
+        return dyn();
+      }
+      return whole;
+    });
+    if (!changed) break;
+  }
+  PATTERN.lastIndex = 0;
+  if (unresolved) for (const m of out.matchAll(PATTERN)) unresolved.add(m[1]);
+  return out;
+}
+var DYNAMIC, PATTERN;
+var init_vars = __esm({
+  "src/core/vars.ts"() {
+    "use strict";
+    init_fake();
+    DYNAMIC = FAKE;
+    PATTERN = /\{\{\s*([^{}\s]+)\s*\}\}/g;
+  }
+});
+
+// src/core/prepare.ts
+function scopeFor(ctx) {
+  const scope2 = scopeOf(ctx.globals, ctx.collection?.variables, ctx.environment?.variables);
+  if (ctx.data) for (const [k, v] of Object.entries(ctx.data)) scope2.set(k, v);
+  if (ctx.locals) for (const [k, v] of ctx.locals) scope2.set(k, v);
+  return scope2;
+}
+function base64Utf8(s) {
+  const bytes = new TextEncoder().encode(s);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+function effectiveAuth(req, collection, folders = []) {
+  if (req.auth.kind !== "inherit") return req.auth;
+  for (const f of folders) if (f.auth.kind !== "inherit") return f.auth;
+  return collection && collection.auth.kind !== "inherit" ? collection.auth : null;
+}
+function pathOf(url) {
+  const { base } = splitUrl(url);
+  const m = base.match(/^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:\{\{[^}]*\}\}|[^/])*(.*)$/i);
+  return m ? m[1] : base;
+}
+function pathVarNames(url) {
+  return [...new Set([...pathOf(url).matchAll(/\/:([A-Za-z_][A-Za-z0-9_-]*)/g)].map((m) => m[1]))];
+}
+function pathVarsFromUrl(url, existing) {
+  return pathVarNames(url).map((name) => existing.find((p) => p.key === name) ?? kv(name, ""));
+}
+function fillPath(url, vars, fill) {
+  const { base, query, hash } = splitUrl(url);
+  const m = base.match(/^([a-z][a-z0-9+.-]*:\/\/[^/]*)(.*)$/i);
+  const origin = m ? m[1] : "";
+  const path = m ? m[2] : base;
+  const filled = path.replace(/(^|\/):([A-Za-z_][A-Za-z0-9_-]*)/g, (whole, slash, name) => {
+    const v = vars.find((p) => p.key === name);
+    return v && v.value !== "" ? `${slash}${encodeComponent(fill(v.value))}` : whole;
+  });
+  return origin + filled + (query ? `?${query}` : "") + hash;
+}
+function prepare(req, ctx = {}) {
+  const scope2 = scopeFor(ctx);
+  const missing = /* @__PURE__ */ new Set();
+  const fill = (s) => interpolate(s, scope2, missing);
+  let url = withScheme(fill(fillPath(req.url, req.pathVars, fill)));
+  const headers = req.headers.filter((h) => h.enabled && h.key.trim()).map((h) => [fill(h.key.trim()), fill(h.value)]);
+  const auth = effectiveAuth(req, ctx.collection, ctx.folders);
+  if (auth) {
+    switch (auth.kind) {
+      case "basic":
+        if (!has(headers, "authorization")) headers.push(["Authorization", `Basic ${base64Utf8(`${fill(auth.username)}:${fill(auth.password)}`)}`]);
+        break;
+      case "bearer":
+        if (!has(headers, "authorization") && auth.token) headers.push(["Authorization", `Bearer ${fill(auth.token)}`]);
+        break;
+      case "oauth2":
+        if (!has(headers, "authorization") && auth.accessToken) headers.push(["Authorization", `Bearer ${auth.accessToken}`]);
+        break;
+      case "apikey":
+        if (auth.key) {
+          if (auth.in === "query") url = appendQuery(url, fill(auth.key), fill(auth.value));
+          else if (!has(headers, auth.key)) headers.push([fill(auth.key), fill(auth.value)]);
+        }
+        break;
+    }
+  }
+  let body = null;
+  let multipart = null;
+  let bodyFile = null;
+  const ct = (v) => {
+    if (!has(headers, "content-type")) headers.push(["Content-Type", v]);
+  };
+  switch (req.body.kind) {
+    case "json":
+      body = fill(req.body.text);
+      ct("application/json");
+      break;
+    case "text":
+      body = fill(req.body.text);
+      ct("text/plain");
+      break;
+    case "xml":
+      body = fill(req.body.text);
+      ct("application/xml");
+      break;
+    case "html":
+      body = fill(req.body.text);
+      ct("text/html");
+      break;
+    case "urlencoded":
+      body = req.body.fields.filter((f) => f.enabled && f.key.trim()).map((f) => `${encodeComponent(fill(f.key.trim()))}=${encodeComponent(fill(f.value))}`).join("&");
+      ct("application/x-www-form-urlencoded");
+      break;
+    case "formdata":
+      multipart = req.body.fields.filter((f) => f.enabled && f.key.trim()).map((f) => f.type === "file" ? { name: fill(f.key.trim()), file: f.file ? { name: f.file.name, type: f.file.type || "application/octet-stream", base64: f.file.base64 } : { name: "", type: "application/octet-stream", base64: "" } } : { name: fill(f.key.trim()), value: fill(f.value) });
+      break;
+    case "binary":
+      if (req.body.file) {
+        bodyFile = { name: req.body.file.name, type: req.body.file.type, base64: req.body.file.base64 };
+        ct(req.body.file.type || "application/octet-stream");
+      }
+      break;
+    case "graphql": {
+      let variables = void 0;
+      const vt = fill(req.body.graphqlVariables).trim();
+      if (vt) {
+        try {
+          variables = JSON.parse(vt);
+        } catch {
+          variables = void 0;
+        }
+      }
+      body = JSON.stringify(variables === void 0 ? { query: fill(req.body.text) } : { query: fill(req.body.text), variables });
+      ct("application/json");
+      break;
+    }
+  }
+  if (req.method === "HEAD") {
+    body = null;
+    multipart = null;
+    bodyFile = null;
+  }
+  return { method: req.method, url, headers, body, multipart, bodyFile, unresolved: [...missing] };
+}
+var has;
+var init_prepare = __esm({
+  "src/core/prepare.ts"() {
+    "use strict";
+    init_types();
+    init_vars();
+    init_url();
+    has = (headers, name) => headers.some(([k]) => k.toLowerCase() === name.toLowerCase());
+  }
+});
+
 // node_modules/yaml/dist/nodes/identity.js
 var require_identity = __commonJS({
   "node_modules/yaml/dist/nodes/identity.js"(exports) {
@@ -7367,6 +8116,209 @@ var require_dist = __commonJS({
     exports.stringify = publicApi.stringify;
     exports.visit = visit.visit;
     exports.visitAsync = visit.visitAsync;
+  }
+});
+
+// src/core/transport.ts
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+function bytesToBase64(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 32768) bin += String.fromCharCode(...bytes.subarray(i, i + 32768));
+  return btoa(bin);
+}
+function fetchBody(p) {
+  if (p.multipart) {
+    const fd = new FormData();
+    for (const part of p.multipart) {
+      if (part.file) fd.append(part.name, new Blob([base64ToBytes(part.file.base64)], { type: part.file.type }), part.file.name || "file");
+      else fd.append(part.name, part.value ?? "");
+    }
+    return fd;
+  }
+  if (p.bodyFile) return new Blob([base64ToBytes(p.bodyFile.base64)], { type: p.bodyFile.type });
+  return p.body ?? void 0;
+}
+function decodeBody(bytes) {
+  try {
+    const body = textDecoder.decode(bytes);
+    if (/[\x00-\x08\x0E-\x1F]/.test(body.slice(0, 2048))) return { body: "", binary: true };
+    return { body, binary: false };
+  } catch {
+    return { body: "", binary: true };
+  }
+}
+var SendError, textDecoder, FetchTransport, CookieTransport;
+var init_transport = __esm({
+  "src/core/transport.ts"() {
+    "use strict";
+    SendError = class extends Error {
+    };
+    textDecoder = new TextDecoder("utf-8", { fatal: true });
+    FetchTransport = class {
+      constructor(fetchImpl = (...a) => fetch(...a)) {
+        this.fetchImpl = fetchImpl;
+      }
+      label = "Browser";
+      unrestricted = false;
+      async send(p, opts) {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(new DOMException("timeout", "TimeoutError")), opts.timeoutMs);
+        const onAbort = () => ctrl.abort(opts.signal?.reason);
+        opts.signal?.addEventListener("abort", onAbort);
+        const started = performance.now();
+        try {
+          const res = await this.fetchImpl(p.url, {
+            method: p.method,
+            headers: p.headers,
+            body: fetchBody(p),
+            redirect: opts.followRedirects ? "follow" : "manual",
+            signal: ctrl.signal
+          });
+          const ttfb = performance.now();
+          const bytes = new Uint8Array(await res.arrayBuffer());
+          const end = performance.now();
+          const decoded = decodeBody(bytes);
+          return {
+            status: res.status,
+            statusText: res.statusText,
+            headers: [...res.headers.entries()],
+            ...decoded,
+            base64: decoded.binary ? bytesToBase64(bytes) : void 0,
+            size: bytes.byteLength,
+            timeMs: Math.round(end - started),
+            timings: { ttfbMs: Math.round(ttfb - started), downloadMs: Math.round(end - ttfb) }
+          };
+        } catch (e) {
+          if (ctrl.signal.aborted) {
+            const why = ctrl.signal.reason;
+            throw new SendError(why instanceof DOMException && why.name === "TimeoutError" ? `No response after ${Math.round(opts.timeoutMs / 1e3)} seconds.` : "Request cancelled.");
+          }
+          throw new SendError(
+            "The browser couldn\u2019t complete this request. Either the server is unreachable, or it doesn\u2019t allow requests from this page (CORS). The desktop app has no such limit."
+          );
+        } finally {
+          clearTimeout(timer);
+          opts.signal?.removeEventListener("abort", onAbort);
+        }
+      }
+    };
+    CookieTransport = class {
+      constructor(inner, jar, enabled = () => true) {
+        this.inner = inner;
+        this.jar = jar;
+        this.enabled = enabled;
+      }
+      get label() {
+        return this.inner.label;
+      }
+      get unrestricted() {
+        return this.inner.unrestricted;
+      }
+      async send(p, opts) {
+        const on = this.enabled();
+        let req = p;
+        if (on && !p.headers.some(([k]) => k.toLowerCase() === "cookie")) {
+          const c2 = this.jar.header(p.url);
+          if (c2) req = { ...p, headers: [...p.headers, ["Cookie", c2]] };
+        }
+        const res = await this.inner.send(req, opts);
+        if (on) this.jar.store(p.url, res.headers);
+        return res;
+      }
+    };
+  }
+});
+
+// src/core/runtime.ts
+function folderChain(folders, folderId) {
+  const chain = [];
+  const seen = /* @__PURE__ */ new Set();
+  let id = folderId;
+  while (id && !seen.has(id)) {
+    seen.add(id);
+    const f = folders.find((x) => x.id === id);
+    if (!f) break;
+    chain.push(f);
+    id = f.parentId;
+  }
+  return chain;
+}
+function sendOptions(req, settings, signal) {
+  return {
+    timeoutMs: req.settings.timeoutMs ?? settings.timeoutMs,
+    followRedirects: req.settings.followRedirects ?? settings.followRedirects,
+    insecureTls: req.settings.insecureTls ?? settings.insecureTls,
+    signal,
+    proxyUrl: settings.proxyUrl,
+    proxyBypass: settings.proxyBypass,
+    clientCerts: settings.clientCerts,
+    caCerts: settings.caCerts
+  };
+}
+function prepareContext(ctx, req) {
+  return {
+    collection: ctx.collection,
+    environment: ctx.environment,
+    globals: ctx.globals,
+    folders: folderChain(ctx.folders, req.folderId),
+    data: ctx.data ?? null,
+    locals: ctx.locals ?? null
+  };
+}
+async function execute(req, ctx, transport, opts, pipeline = {}) {
+  const out = { sent: prepare(req, prepareContext(ctx, req)), response: null, error: null, tests: [], logs: [], changes: noChanges() };
+  if (req.protocol === "browser") {
+    if (!pipeline.browser) {
+      out.error = "Browser login needs the desktop app or dispatch-run (a web page can\u2019t start a browser).";
+      return out;
+    }
+    try {
+      await pipeline.browser(req, ctx, out, opts.signal);
+    } catch (e) {
+      out.error = e instanceof Error ? e.message : String(e);
+    }
+    return out;
+  }
+  try {
+    const finalReq = pipeline.beforeSend ? await pipeline.beforeSend(req, ctx, out) : req;
+    if (out.scriptError) throw new SendError(`Not sent: the pre-request script failed. ${out.scriptError}`);
+    let sent = prepare(finalReq, prepareContext(ctx, finalReq));
+    if (pipeline.sign) sent = await pipeline.sign(sent, finalReq, ctx, out);
+    out.sent = sent;
+    if (!sent.url) throw new SendError("Enter a URL to send the request to.");
+    try {
+      new URL(sent.url);
+    } catch {
+      throw new SendError(sent.unresolved.length ? `The URL still has {{${sent.unresolved[0]}}} in it. Pick an environment that defines it, or add it as a variable.` : "That URL isn\u2019t valid.");
+    }
+    let response = await transport.send(sent, opts);
+    if (pipeline.retry) {
+      const again = await pipeline.retry(sent, response, finalReq, ctx, (p) => transport.send(p, opts));
+      if (again) {
+        out.sent = again.sent;
+        response = again.response;
+      }
+    }
+    out.response = response;
+    if (pipeline.afterResponse) await pipeline.afterResponse(finalReq, ctx, out);
+  } catch (e) {
+    if (e instanceof Error && e.name === "SkipRequest") out.skipped = true;
+    out.error = e instanceof SendError ? e.message : `The request failed: ${e instanceof Error ? e.message : String(e)}`;
+  }
+  return out;
+}
+var noChanges;
+var init_runtime = __esm({
+  "src/core/runtime.ts"() {
+    "use strict";
+    init_prepare();
+    init_transport();
+    noChanges = () => ({ environment: null, collection: null, globals: null });
   }
 });
 
@@ -15035,7 +15987,7 @@ var require_lodash = __commonJS({
           }
           return mapped.length && mapped[0] === arrays[0] ? baseIntersection(mapped, undefined2, comparator) : [];
         });
-        function join2(array, separator) {
+        function join3(array, separator) {
           return array == null ? "" : nativeJoin.call(array, separator);
         }
         function last(array) {
@@ -16959,7 +17911,7 @@ var require_lodash = __commonJS({
         lodash.isUndefined = isUndefined;
         lodash.isWeakMap = isWeakMap;
         lodash.isWeakSet = isWeakSet;
-        lodash.join = join2;
+        lodash.join = join3;
         lodash.kebabCase = kebabCase;
         lodash.last = last;
         lodash.lastIndexOf = lastIndexOf;
@@ -38454,7 +39406,7 @@ var require_util2 = __commonJS({
       return path;
     }
     exports.normalize = normalize;
-    function join2(aRoot, aPath) {
+    function join3(aRoot, aPath) {
       if (aRoot === "") {
         aRoot = ".";
       }
@@ -38486,7 +39438,7 @@ var require_util2 = __commonJS({
       }
       return joined;
     }
-    exports.join = join2;
+    exports.join = join3;
     exports.isAbsolute = function(aPath) {
       return aPath.charAt(0) === "/" || urlRegexp.test(aPath);
     };
@@ -38659,7 +39611,7 @@ var require_util2 = __commonJS({
             parsed.path = parsed.path.substring(0, index + 1);
           }
         }
-        sourceURL = join2(urlGenerate(parsed), sourceURL);
+        sourceURL = join3(urlGenerate(parsed), sourceURL);
       }
       return normalize(sourceURL);
     }
@@ -41342,111 +42294,193 @@ var init_scriptLibs = __esm({
   }
 });
 
-// src/cli/main.ts
-import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { join, relative } from "node:path";
-
-// src/core/types.ts
-var METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
-var defaultSettings = {
-  activeEnvId: null,
-  theme: "system",
-  timeoutMs: 3e4,
-  followRedirects: true,
-  insecureTls: false,
-  cookieJar: true,
-  proxyUrl: "",
-  proxyBypass: "localhost, 127.0.0.1",
-  clientCerts: [],
-  caCerts: []
-};
-var counter = 0;
-function uid() {
-  const c2 = globalThis.crypto;
-  if (c2?.randomUUID) return c2.randomUUID();
-  return `${Date.now().toString(36)}-${(counter++).toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-}
-var kv = (key = "", value = "", enabled = true, extra = {}) => ({ id: uid(), key, value, enabled, ...extra });
-var emptyAuth = (kind = "inherit") => ({
-  kind,
-  username: "",
-  password: "",
-  token: "",
-  key: "",
-  value: "",
-  in: "header",
-  grant: "client_credentials",
-  tokenUrl: "",
-  authUrl: "",
-  clientId: "",
-  clientSecret: "",
-  scope: "",
-  redirectUri: "http://127.0.0.1:45719/callback",
-  usePkce: true,
-  clientAuth: "header",
-  accessToken: "",
-  refreshToken: "",
-  expiresAt: 0,
-  algorithm: "HS256",
-  secret: "",
-  payload: '{\n  "sub": "1234"\n}',
-  headerPrefix: "Bearer",
-  accessKey: "",
-  secretKey: "",
-  sessionToken: "",
-  region: "us-east-1",
-  service: "execute-api"
+// src/core/scriptPipeline.ts
+var scriptPipeline_exports = {};
+__export(scriptPipeline_exports, {
+  InlineEngine: () => InlineEngine,
+  SCRIPT_TIMEOUT_MS: () => SCRIPT_TIMEOUT_MS,
+  SkipRequest: () => SkipRequest,
+  applyVars: () => applyVars,
+  scriptPipeline: () => scriptPipeline
 });
-var emptyBody = (kind = "none") => ({ kind, text: "", fields: [], graphqlVariables: "", file: null });
-var emptyScripts = () => ({ pre: "", post: "" });
-var emptySettings = () => ({ timeoutMs: null, followRedirects: null, insecureTls: null });
-function newRequest(partial = {}) {
-  return normalizeRequest({ id: uid(), name: "New request", updatedAt: Date.now(), sort: Date.now(), ...partial });
+function applyVars(rows, next) {
+  const seen = /* @__PURE__ */ new Set();
+  const out = [];
+  for (const r of rows) {
+    const k = r.key.trim();
+    if (!r.enabled || !k) {
+      out.push(r);
+      continue;
+    }
+    if (!(k in next)) continue;
+    seen.add(k);
+    out.push(r.value === next[k] ? r : { ...r, value: next[k] });
+  }
+  for (const [k, v] of Object.entries(next)) if (!seen.has(k)) out.push({ id: `v-${k}-${Math.random().toString(36).slice(2, 8)}`, key: k, value: v, enabled: true });
+  return out;
 }
-function normalizeRequest(r) {
+function pmRequestOf(req) {
+  const raw = ["json", "text", "xml", "html", "graphql"].includes(req.body.kind);
   return {
-    name: "New request",
-    protocol: "http",
-    method: "GET",
-    url: "",
-    params: [],
-    pathVars: [],
-    headers: [],
-    docs: "",
-    examples: [],
-    collectionId: null,
-    folderId: null,
-    sort: 0,
-    updatedAt: Date.now(),
-    ...r,
-    body: { ...emptyBody(), ...r.body },
-    auth: { ...emptyAuth(), ...r.auth },
-    scripts: { ...emptyScripts(), ...r.scripts },
-    settings: { ...emptySettings(), ...r.settings },
-    ws: { messages: [], ...r.ws },
-    mqtt: { clientId: "", topics: [], publishTopic: "", payload: "", qos: 0, retain: false, ...r.mqtt },
-    grpc: { method: "", proto: "", useReflection: true, message: "{}", metadata: [], tls: false, ...r.grpc },
-    sio: { listen: "", emitEvent: "message", ...r.sio }
+    name: req.name,
+    url: req.url,
+    method: req.method,
+    headers: req.headers.filter((h) => h.key.trim()).map((h) => ({ key: h.key, value: h.value, disabled: !h.enabled })),
+    body: { mode: raw ? req.body.kind === "graphql" ? "graphql" : "raw" : req.body.kind === "none" ? "none" : req.body.kind === "binary" ? "file" : req.body.kind === "formdata" ? "formdata" : "urlencoded", raw: raw ? req.body.text : "" }
   };
 }
-function newCollection(name = "New collection") {
-  return normalizeCollection({ id: uid(), name });
+function pmRequestOfSent(name, p) {
+  return { name, url: p.url, method: p.method, headers: p.headers.map(([key, value]) => ({ key, value })), body: { mode: p.body == null ? "none" : "raw", raw: p.body ?? "" } };
 }
-function normalizeCollection(c2) {
-  return { name: "Collection", variables: [], docs: "", linkedDir: "", updatedAt: Date.now(), ...c2, auth: { ...emptyAuth("none"), ...c2.auth }, scripts: { ...emptyScripts(), ...c2.scripts } };
+function applyPmRequest(req, before, after) {
+  if (JSON.stringify(before) === JSON.stringify(after)) return req;
+  const next = structuredClone(req);
+  if (after.url !== before.url) {
+    next.url = after.url;
+    next.params = paramsFromUrl(after.url, next.params);
+  }
+  if (after.method !== before.method && METHODS.includes(after.method)) next.method = after.method;
+  if (JSON.stringify(after.headers) !== JSON.stringify(before.headers)) {
+    next.headers = after.headers.map((h, i) => ({ id: next.headers[i]?.id ?? `h-${i}-${Date.now()}`, key: h.key, value: h.value, enabled: !h.disabled }));
+  }
+  if (after.body.raw !== before.body.raw) {
+    if (!["json", "text", "xml", "html", "graphql"].includes(next.body.kind)) next.body = { ...next.body, kind: "text" };
+    next.body = { ...next.body, text: after.body.raw };
+  }
+  return next;
 }
-function newFolder(collectionId, name = "New folder", parentId = null) {
-  return normalizeFolder({ id: uid(), name, collectionId, parentId, sort: Date.now() });
+function scriptPipeline(o) {
+  const host = {
+    async sendRequest(r) {
+      const method = METHODS.includes(r.method.toUpperCase()) ? r.method.toUpperCase() : "GET";
+      const p = {
+        method,
+        url: withScheme(r.url),
+        headers: r.headers.filter((h) => !h.disabled).map((h) => [h.key, h.value]),
+        body: r.body.mode === "none" ? null : r.body.raw,
+        unresolved: []
+      };
+      const res = await o.transport.send(p, o.sendOptions());
+      return { code: res.status, status: res.statusText, headers: res.headers, body: res.body, responseTime: res.timeMs, responseSize: res.size };
+    }
+  };
+  const scriptsFor = (req, ctx, phase) => {
+    const folders = folderChain(ctx.folders, req.folderId).reverse();
+    const list = [];
+    if (ctx.collection?.scripts[phase].trim()) list.push({ source: `Collection \u201C${ctx.collection.name}\u201D`, code: ctx.collection.scripts[phase] });
+    for (const f of folders) if (f.scripts[phase].trim()) list.push({ source: `Folder \u201C${f.name}\u201D`, code: f.scripts[phase] });
+    if (req.scripts[phase].trim()) list.push({ source: `Request \u201C${req.name}\u201D`, code: req.scripts[phase] });
+    return list;
+  };
+  const runPhase = async (phase, req, ctx, out, pmReq, response) => {
+    const scripts = scriptsFor(req, ctx, phase);
+    if (!scripts.length) return { request: pmReq, skip: false };
+    ctx.locals ??= /* @__PURE__ */ new Map();
+    const start = {
+      globals: toRecord(ctx.globals),
+      collection: toRecord(ctx.collection?.variables),
+      environment: toRecord(ctx.environment?.variables),
+      data: { ...ctx.data ?? {} },
+      locals: Object.fromEntries(ctx.locals)
+    };
+    let vars = start;
+    let request = pmReq;
+    let skip = false;
+    const it = o.iteration?.() ?? { iteration: 0, iterationCount: 1 };
+    for (const s of scripts) {
+      const r = await o.engine.run({ phase, source: s.source, code: s.code, request, response, vars, info: { requestName: req.name, requestId: req.id, ...it } }, host);
+      out.tests.push(...r.tests);
+      out.logs.push(...r.logs);
+      vars = r.vars;
+      request = r.request;
+      if (r.skip) skip = true;
+      if (r.nextRequest !== void 0) out.nextRequest = r.nextRequest;
+      if (r.visualizer) out.visualizer = r.visualizer;
+      if (r.error && phase === "post") out.tests.push({ name: `${s.source} script error`, passed: false, error: r.error });
+      if (r.error && phase === "pre") out.scriptError = `${s.source}: ${r.error}`;
+    }
+    if (!sameVars(start.environment, vars.environment) && ctx.environment) {
+      const variables = applyVars(ctx.environment.variables, vars.environment);
+      ctx.environment = { ...ctx.environment, variables };
+      out.changes.environment = variables;
+    }
+    if (!sameVars(start.collection, vars.collection) && ctx.collection) {
+      const variables = applyVars(ctx.collection.variables, vars.collection);
+      ctx.collection = { ...ctx.collection, variables };
+      out.changes.collection = variables;
+    }
+    if (!sameVars(start.globals, vars.globals)) {
+      ctx.globals = applyVars(ctx.globals, vars.globals);
+      out.changes.globals = ctx.globals;
+    }
+    ctx.locals = new Map(Object.entries(vars.locals));
+    return { request, skip };
+  };
+  return {
+    async beforeSend(req, ctx, out) {
+      const before = pmRequestOf(req);
+      const { request, skip } = await runPhase("pre", req, ctx, out, before, null);
+      if (skip) throw new SkipRequest("Skipped: a pre-request script called pm.execution.skipRequest().");
+      return applyPmRequest(req, before, request);
+    },
+    async afterResponse(req, ctx, out) {
+      if (!out.response) return;
+      const r = out.response;
+      await runPhase(
+        "post",
+        req,
+        ctx,
+        out,
+        pmRequestOfSent(req.name, out.sent),
+        { code: r.status, status: r.statusText, headers: r.headers, body: r.body, responseTime: r.timeMs, responseSize: r.size }
+      );
+    }
+  };
 }
-function normalizeFolder(f) {
-  return { name: "Folder", parentId: null, docs: "", sort: 0, updatedAt: Date.now(), ...f, auth: { ...emptyAuth("inherit"), ...f.auth }, scripts: { ...emptyScripts(), ...f.scripts } };
-}
-function newEnvironment(name = "New environment") {
-  return { id: uid(), name, variables: [], updatedAt: Date.now() };
-}
-var bySort = (a, b) => a.sort - b.sort || a.name.localeCompare(b.name);
+var SCRIPT_TIMEOUT_MS, InlineEngine, SkipRequest, toRecord, sameVars;
+var init_scriptPipeline = __esm({
+  "src/core/scriptPipeline.ts"() {
+    "use strict";
+    init_types();
+    init_transport();
+    init_runtime();
+    init_url();
+    SCRIPT_TIMEOUT_MS = 1e4;
+    InlineEngine = class {
+      constructor(compile, timeoutMs = SCRIPT_TIMEOUT_MS) {
+        this.compile = compile;
+        this.timeoutMs = timeoutMs;
+      }
+      run(input, host) {
+        const go = Promise.all([Promise.resolve().then(() => (init_scripts(), scripts_exports)), Promise.resolve().then(() => (init_scriptLibs(), scriptLibs_exports))]).then(async ([m, l]) => m.runScript(input, host, this.compile ?? m.compileWithFunction, await l.loadLibs(l.neededLibs(input.code))));
+        let timer;
+        const timeout = new Promise((resolve) => {
+          timer = setTimeout(() => resolve({
+            tests: [],
+            logs: [{ level: "error", text: `${input.source}: script took longer than ${this.timeoutMs / 1e3} s and was stopped.`, at: Date.now(), source: input.source }],
+            vars: input.vars,
+            request: input.request,
+            skip: false,
+            error: `Script took longer than ${this.timeoutMs / 1e3} s.`
+          }), this.timeoutMs);
+        });
+        return Promise.race([go, timeout]).finally(() => clearTimeout(timer));
+      }
+    };
+    SkipRequest = class extends SendError {
+      name = "SkipRequest";
+    };
+    toRecord = (rows) => Object.fromEntries((rows ?? []).filter((v) => v.enabled && v.key.trim()).map((v) => [v.key.trim(), v.value]));
+    sameVars = (a, b) => JSON.stringify(Object.entries(a).sort()) === JSON.stringify(Object.entries(b).sort());
+  }
+});
+
+// src/cli/main.ts
+import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { join as join2, relative } from "node:path";
 
 // src/core/fileFormat.ts
+init_types();
 var ROOT_FILE = "dispatch.collection.yaml";
 var SECRET_AUTH = ["password", "token", "value", "clientSecret", "accessToken", "refreshToken", "secret", "secretKey", "sessionToken"];
 function filesToCollection(files, parse2, local) {
@@ -41561,52 +42595,13 @@ function filesToCollection(files, parse2, local) {
 import { basename } from "node:path";
 import vm from "node:vm";
 
-// src/core/url.ts
-function splitUrl(url) {
-  const h = url.indexOf("#");
-  const hash = h >= 0 ? url.slice(h) : "";
-  const rest = h >= 0 ? url.slice(0, h) : url;
-  const q = rest.indexOf("?");
-  return q >= 0 ? { base: rest.slice(0, q), query: rest.slice(q + 1), hash } : { base: rest, query: "", hash };
-}
-function decode(s) {
-  try {
-    return decodeURIComponent(s.replace(/\+/g, " "));
-  } catch {
-    return s;
-  }
-}
-function encodeComponent(s) {
-  return s.split(/(\{\{[^{}]*\}\})/).map((part, i) => i % 2 ? part : encodeURIComponent(part)).join("");
-}
-function parseQuery(query) {
-  if (!query) return [];
-  return query.split("&").filter(Boolean).map((pair) => {
-    const eq = pair.indexOf("=");
-    return eq >= 0 ? { key: decode(pair.slice(0, eq)), value: decode(pair.slice(eq + 1)) } : { key: decode(pair), value: "" };
-  });
-}
-function paramsFromUrl(url, existing) {
-  const pool = existing.filter((p) => p.enabled);
-  const enabled = parseQuery(splitUrl(url).query).map(({ key, value }) => {
-    const i = pool.findIndex((p) => p.key === key);
-    const reuse = i >= 0 ? pool.splice(i, 1)[0] : null;
-    return reuse ? { ...reuse, value } : kv(key, value);
-  });
-  return [...enabled, ...existing.filter((p) => !p.enabled)];
-}
-function withScheme(url) {
-  const t = url.trim();
-  if (!t || /^[a-z][a-z0-9+.-]*:\/\//i.test(t)) return t;
-  return (/^(localhost|127\.|\[::1\])/i.test(t) ? "http://" : "https://") + t;
-}
-function appendQuery(url, key, value) {
-  const { base, query, hash } = splitUrl(url);
-  const pair = `${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
-  return `${base}?${query ? `${query}&` : ""}${pair}${hash}`;
-}
+// src/core/backup.ts
+init_types();
+init_url();
 
 // src/core/openapi.ts
+init_types();
+init_url();
 var str = (v) => v == null ? "" : typeof v === "string" ? v : JSON.stringify(v);
 function deref(spec, v, seen = /* @__PURE__ */ new Set()) {
   if (!v || typeof v !== "object" || typeof v.$ref !== "string") return v;
@@ -41828,281 +42823,10 @@ function importHar(har) {
   return { source: "har", collections: [col], folders: [], requests, environments: [], warnings };
 }
 
-// src/core/fake.ts
-var FIRST = ["Aarav", "Maya", "Liam", "Zara", "Noah", "Ana", "Kenji", "Amara", "Lucas", "Priya", "Omar", "Elena", "Kofi", "Mei", "Ivan", "Sara", "Diego", "Nia", "Arjun", "Leila", "Tom\xE1s", "Hana", "Ravi", "Freya"];
-var LAST = ["Sharma", "Okafor", "Garc\xEDa", "Nguyen", "M\xFCller", "Kowalski", "Haddad", "Tanaka", "Silva", "Johansson", "Mensah", "Rossi", "Patel", "Kim", "Novak", "Dubois", "Ahmed", "Costa", "Ivanova", "Walker"];
-var WORDS = ["river", "lantern", "orbit", "maple", "signal", "harbor", "copper", "meadow", "pixel", "summit", "velvet", "canyon", "ember", "quartz", "willow", "beacon", "cobalt", "tundra", "fable", "nimbus"];
-var ADJ = ["quick", "quiet", "bright", "gentle", "brave", "clever", "calm", "eager", "fancy", "jolly", "lively", "proud", "silly", "witty", "tidy"];
-var VERBS = ["build", "carry", "draw", "fetch", "gather", "jump", "lift", "mend", "paint", "reach", "sail", "shape", "sort", "trace", "weave"];
-var CITIES = ["Pune", "Lagos", "Lisbon", "Osaka", "Toronto", "Nairobi", "Krak\xF3w", "Medell\xEDn", "Melbourne", "Tallinn", "Accra", "Hanoi", "Valencia", "Bergen"];
-var COUNTRIES = [["India", "IN"], ["Nigeria", "NG"], ["Portugal", "PT"], ["Japan", "JP"], ["Canada", "CA"], ["Kenya", "KE"], ["Poland", "PL"], ["Colombia", "CO"], ["Australia", "AU"], ["Estonia", "EE"], ["Ghana", "GH"], ["Vietnam", "VN"], ["Spain", "ES"], ["Norway", "NO"]];
-var STREETS = ["Oak", "Mill", "Station", "Harbor", "Church", "Park", "Garden", "Lake", "Hill", "Market"];
-var SUFFIX = ["Street", "Road", "Lane", "Avenue", "Way", "Close"];
-var COMPANY = ["Labs", "Works", "Systems", "Collective", "Studio", "Group", "Partners", "Co"];
-var JOB_LEVEL = ["Senior", "Lead", "Junior", "Principal", "Staff", "Associate"];
-var JOB_AREA = ["Data", "Platform", "Product", "Security", "Support", "Design", "Finance", "Research"];
-var JOB_TYPE = ["Engineer", "Analyst", "Designer", "Manager", "Consultant", "Specialist", "Architect"];
-var DEPARTMENTS = ["Books", "Garden", "Toys", "Music", "Outdoors", "Kitchen", "Health", "Tools", "Games", "Home"];
-var PRODUCTS = ["Chair", "Lamp", "Backpack", "Kettle", "Notebook", "Headphones", "Bottle", "Jacket", "Mug", "Desk"];
-var MATERIAL = ["Wooden", "Steel", "Cotton", "Ceramic", "Bamboo", "Leather", "Glass", "Recycled"];
-var CURRENCIES = ["USD", "EUR", "INR", "GBP", "JPY", "NGN", "BRL", "CAD", "AUD", "KES"];
-var LOCALES = ["en", "en-GB", "hi", "fr", "de", "es", "pt-BR", "ja", "ko", "sw", "pl"];
-var MIME = ["application/json", "text/plain", "image/png", "image/jpeg", "application/pdf", "text/csv", "application/zip"];
-var EXT = ["json", "txt", "png", "jpg", "pdf", "csv", "zip"];
-var TLD = ["com", "org", "net", "io", "dev", "test"];
-var COLORS = ["red", "orange", "yellow", "green", "teal", "blue", "indigo", "violet", "pink", "brown", "grey"];
-var UA = [
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
-  "Mozilla/5.0 (Linux; Android 14; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36"
-];
-var int = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
-var pick = (a) => a[int(0, a.length - 1)];
-var cap = (s) => s[0].toUpperCase() + s.slice(1);
-var hex = (n) => Array.from({ length: n }, () => int(0, 15).toString(16)).join("");
-var chars = (n, set2) => Array.from({ length: n }, () => set2[int(0, set2.length - 1)]).join("");
-var ALNUM = "abcdefghijklmnopqrstuvwxyz0123456789";
-var plain = (s) => s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
-var sentence = () => {
-  const w = Array.from({ length: int(5, 10) }, () => pick([...WORDS, ...ADJ, ...VERBS]));
-  return `${cap(w.join(" "))}.`;
-};
-var daysFromNow = (d) => new Date(Date.now() + d * 864e5).toISOString();
-var domain = () => `${pick(WORDS)}${pick(["", "-", ""])}${pick(WORDS)}.${pick(TLD)}`;
-var FAKE = {
-  $guid: () => uid(),
-  $uuid: () => uid(),
-  $randomUUID: () => uid(),
-  $timestamp: () => String(Math.floor(Date.now() / 1e3)),
-  $isoTimestamp: () => (/* @__PURE__ */ new Date()).toISOString(),
-  $randomInt: () => String(int(0, 1e3)),
-  $randomBoolean: () => String(Math.random() < 0.5),
-  $randomAlphaNumeric: () => chars(1, ALNUM),
-  $randomHexColor: () => `#${hex(6)}`,
-  $randomColor: () => pick(COLORS),
-  $randomAbbreviation: () => pick(["API", "SQL", "JSON", "HTTP", "TCP", "CSS", "XML", "SSL"]),
-  $randomFirstName: () => pick(FIRST),
-  $randomLastName: () => pick(LAST),
-  $randomFullName: () => `${pick(FIRST)} ${pick(LAST)}`,
-  $randomNamePrefix: () => pick(["Mr.", "Ms.", "Mx.", "Dr."]),
-  $randomUserName: () => `${plain(pick(FIRST))}${pick([".", "_", ""])}${plain(pick(LAST))}${int(1, 99)}`,
-  $randomEmail: () => `${plain(pick(FIRST))}.${plain(pick(LAST))}${int(1, 999)}@example.${pick(["com", "org", "net"])}`,
-  $randomExampleEmail: () => `${plain(pick(FIRST))}${int(1, 99)}@example.com`,
-  $randomPassword: () => chars(15, `${ALNUM}ABCDEFGHJKLMNPQRSTUVWXYZ!@#$%`),
-  $randomPhoneNumber: () => `+1-${int(200, 989)}-${int(200, 999)}-${String(int(0, 9999)).padStart(4, "0")}`,
-  $randomPhoneNumberExt: () => `+1-${int(200, 989)}-${int(200, 999)}-${String(int(0, 9999)).padStart(4, "0")} x${int(10, 999)}`,
-  $randomCity: () => pick(CITIES),
-  $randomCountry: () => pick(COUNTRIES)[0],
-  $randomCountryCode: () => pick(COUNTRIES)[1],
-  $randomStreetName: () => `${pick(STREETS)} ${pick(SUFFIX)}`,
-  $randomStreetAddress: () => `${int(1, 9999)} ${pick(STREETS)} ${pick(SUFFIX)}`,
-  $randomZipCode: () => String(int(1e4, 99999)),
-  $randomLatitude: () => (Math.random() * 180 - 90).toFixed(4),
-  $randomLongitude: () => (Math.random() * 360 - 180).toFixed(4),
-  $randomCompanyName: () => `${cap(pick(WORDS))} ${pick(COMPANY)}`,
-  $randomCatchPhrase: () => `${cap(pick(ADJ))} ${pick(WORDS)} for ${pick(WORDS)}s`,
-  $randomJobTitle: () => `${pick(JOB_LEVEL)} ${pick(JOB_AREA)} ${pick(JOB_TYPE)}`,
-  $randomJobArea: () => pick(JOB_AREA),
-  $randomJobType: () => pick(JOB_TYPE),
-  $randomDepartment: () => pick(DEPARTMENTS),
-  $randomProduct: () => pick(PRODUCTS),
-  $randomProductName: () => `${pick(ADJ) === "quick" ? "Handy" : cap(pick(ADJ))} ${pick(MATERIAL)} ${pick(PRODUCTS)}`,
-  $randomProductMaterial: () => pick(MATERIAL),
-  $randomPrice: () => (int(100, 99999) / 100).toFixed(2),
-  $randomCurrencyCode: () => pick(CURRENCIES),
-  $randomBankAccount: () => String(int(1e7, 99999999)),
-  $randomBankAccountIban: () => `GB${int(10, 99)}TEST${String(int(0, 99999999)).padStart(8, "0")}${String(int(0, 999999)).padStart(6, "0")}`,
-  $randomCreditCardMask: () => String(int(1e3, 9999)),
-  $randomWord: () => pick(WORDS),
-  $randomWords: () => Array.from({ length: int(2, 5) }, () => pick(WORDS)).join(" "),
-  $randomNoun: () => pick(WORDS),
-  $randomVerb: () => pick(VERBS),
-  $randomAdjective: () => pick(ADJ),
-  $randomLoremWord: () => pick(WORDS),
-  $randomLoremWords: () => Array.from({ length: 3 }, () => pick(WORDS)).join(" "),
-  $randomLoremSentence: sentence,
-  $randomLoremParagraph: () => Array.from({ length: int(3, 5) }, sentence).join(" "),
-  $randomLoremSlug: () => Array.from({ length: 3 }, () => pick(WORDS)).join("-"),
-  $randomDomainName: domain,
-  $randomDomainWord: () => pick(WORDS),
-  $randomUrl: () => `https://${domain()}/${pick(WORDS)}`,
-  $randomIP: () => `${int(1, 223)}.${int(0, 255)}.${int(0, 255)}.${int(1, 254)}`,
-  $randomIPV6: () => Array.from({ length: 8 }, () => hex(4)).join(":"),
-  $randomMACAddress: () => Array.from({ length: 6 }, () => hex(2)).join(":"),
-  $randomUserAgent: () => pick(UA),
-  $randomSemver: () => `${int(0, 9)}.${int(0, 20)}.${int(0, 30)}`,
-  $randomLocale: () => pick(LOCALES),
-  $randomMimeType: () => pick(MIME),
-  $randomFileName: () => `${pick(WORDS)}_${pick(WORDS)}.${pick(EXT)}`,
-  $randomFileExt: () => pick(EXT),
-  $randomDateFuture: () => daysFromNow(int(1, 365)),
-  $randomDatePast: () => daysFromNow(-int(1, 365)),
-  $randomDateRecent: () => daysFromNow(-Math.random() * 2),
-  $randomWeekday: () => pick(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]),
-  $randomMonth: () => pick(["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]),
-  $randomAvatarImage: () => `https://example.com/avatars/${int(1, 999)}.png`
-};
-
-// src/core/vars.ts
-function scopeOf(...layers) {
-  const m = /* @__PURE__ */ new Map();
-  for (const layer of layers) for (const v of layer ?? []) if (v.enabled && v.key.trim()) m.set(v.key.trim(), v.value);
-  return m;
-}
-var DYNAMIC = FAKE;
-var PATTERN = /\{\{\s*([^{}\s]+)\s*\}\}/g;
-function interpolate(text, scope2, unresolved) {
-  let out = text;
-  for (let depth = 0; depth < 5 && PATTERN.test(out); depth++) {
-    PATTERN.lastIndex = 0;
-    let changed = false;
-    out = out.replace(PATTERN, (whole, name) => {
-      if (scope2.has(name)) {
-        changed = true;
-        return scope2.get(name);
-      }
-      const dyn = DYNAMIC[name];
-      if (dyn) {
-        changed = true;
-        return dyn();
-      }
-      return whole;
-    });
-    if (!changed) break;
-  }
-  PATTERN.lastIndex = 0;
-  if (unresolved) for (const m of out.matchAll(PATTERN)) unresolved.add(m[1]);
-  return out;
-}
-
-// src/core/prepare.ts
-function scopeFor(ctx) {
-  const scope2 = scopeOf(ctx.globals, ctx.collection?.variables, ctx.environment?.variables);
-  if (ctx.data) for (const [k, v] of Object.entries(ctx.data)) scope2.set(k, v);
-  if (ctx.locals) for (const [k, v] of ctx.locals) scope2.set(k, v);
-  return scope2;
-}
-function base64Utf8(s) {
-  const bytes = new TextEncoder().encode(s);
-  let bin = "";
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return btoa(bin);
-}
-function effectiveAuth(req, collection, folders = []) {
-  if (req.auth.kind !== "inherit") return req.auth;
-  for (const f of folders) if (f.auth.kind !== "inherit") return f.auth;
-  return collection && collection.auth.kind !== "inherit" ? collection.auth : null;
-}
-var has = (headers, name) => headers.some(([k]) => k.toLowerCase() === name.toLowerCase());
-function pathOf(url) {
-  const { base } = splitUrl(url);
-  const m = base.match(/^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:\{\{[^}]*\}\}|[^/])*(.*)$/i);
-  return m ? m[1] : base;
-}
-function pathVarNames(url) {
-  return [...new Set([...pathOf(url).matchAll(/\/:([A-Za-z_][A-Za-z0-9_-]*)/g)].map((m) => m[1]))];
-}
-function pathVarsFromUrl(url, existing) {
-  return pathVarNames(url).map((name) => existing.find((p) => p.key === name) ?? kv(name, ""));
-}
-function fillPath(url, vars, fill) {
-  const { base, query, hash } = splitUrl(url);
-  const m = base.match(/^([a-z][a-z0-9+.-]*:\/\/[^/]*)(.*)$/i);
-  const origin = m ? m[1] : "";
-  const path = m ? m[2] : base;
-  const filled = path.replace(/(^|\/):([A-Za-z_][A-Za-z0-9_-]*)/g, (whole, slash, name) => {
-    const v = vars.find((p) => p.key === name);
-    return v && v.value !== "" ? `${slash}${encodeComponent(fill(v.value))}` : whole;
-  });
-  return origin + filled + (query ? `?${query}` : "") + hash;
-}
-function prepare(req, ctx = {}) {
-  const scope2 = scopeFor(ctx);
-  const missing = /* @__PURE__ */ new Set();
-  const fill = (s) => interpolate(s, scope2, missing);
-  let url = withScheme(fill(fillPath(req.url, req.pathVars, fill)));
-  const headers = req.headers.filter((h) => h.enabled && h.key.trim()).map((h) => [fill(h.key.trim()), fill(h.value)]);
-  const auth = effectiveAuth(req, ctx.collection, ctx.folders);
-  if (auth) {
-    switch (auth.kind) {
-      case "basic":
-        if (!has(headers, "authorization")) headers.push(["Authorization", `Basic ${base64Utf8(`${fill(auth.username)}:${fill(auth.password)}`)}`]);
-        break;
-      case "bearer":
-        if (!has(headers, "authorization") && auth.token) headers.push(["Authorization", `Bearer ${fill(auth.token)}`]);
-        break;
-      case "oauth2":
-        if (!has(headers, "authorization") && auth.accessToken) headers.push(["Authorization", `Bearer ${auth.accessToken}`]);
-        break;
-      case "apikey":
-        if (auth.key) {
-          if (auth.in === "query") url = appendQuery(url, fill(auth.key), fill(auth.value));
-          else if (!has(headers, auth.key)) headers.push([fill(auth.key), fill(auth.value)]);
-        }
-        break;
-    }
-  }
-  let body = null;
-  let multipart = null;
-  let bodyFile = null;
-  const ct = (v) => {
-    if (!has(headers, "content-type")) headers.push(["Content-Type", v]);
-  };
-  switch (req.body.kind) {
-    case "json":
-      body = fill(req.body.text);
-      ct("application/json");
-      break;
-    case "text":
-      body = fill(req.body.text);
-      ct("text/plain");
-      break;
-    case "xml":
-      body = fill(req.body.text);
-      ct("application/xml");
-      break;
-    case "html":
-      body = fill(req.body.text);
-      ct("text/html");
-      break;
-    case "urlencoded":
-      body = req.body.fields.filter((f) => f.enabled && f.key.trim()).map((f) => `${encodeComponent(fill(f.key.trim()))}=${encodeComponent(fill(f.value))}`).join("&");
-      ct("application/x-www-form-urlencoded");
-      break;
-    case "formdata":
-      multipart = req.body.fields.filter((f) => f.enabled && f.key.trim()).map((f) => f.type === "file" ? { name: fill(f.key.trim()), file: f.file ? { name: f.file.name, type: f.file.type || "application/octet-stream", base64: f.file.base64 } : { name: "", type: "application/octet-stream", base64: "" } } : { name: fill(f.key.trim()), value: fill(f.value) });
-      break;
-    case "binary":
-      if (req.body.file) {
-        bodyFile = { name: req.body.file.name, type: req.body.file.type, base64: req.body.file.base64 };
-        ct(req.body.file.type || "application/octet-stream");
-      }
-      break;
-    case "graphql": {
-      let variables = void 0;
-      const vt = fill(req.body.graphqlVariables).trim();
-      if (vt) {
-        try {
-          variables = JSON.parse(vt);
-        } catch {
-          variables = void 0;
-        }
-      }
-      body = JSON.stringify(variables === void 0 ? { query: fill(req.body.text) } : { query: fill(req.body.text), variables });
-      ct("application/json");
-      break;
-    }
-  }
-  if (req.method === "HEAD") {
-    body = null;
-    multipart = null;
-    bodyFile = null;
-  }
-  return { method: req.method, url, headers, body, multipart, bodyFile, unresolved: [...missing] };
-}
-
 // src/core/interop.ts
+init_types();
+init_url();
+init_prepare();
 var isInsomnia = (d) => d?._type === "export" && Array.isArray(d.resources) && String(d.__export_source ?? "").includes("insomnia");
 var insomniaVars = (s) => s.replace(/\{\{\s*_\.([\w.-]+)\s*\}\}/g, "{{$1}}");
 function importInsomnia(d) {
@@ -42236,13 +42960,19 @@ function importDispatch(d) {
   const folders = rawFolders.filter((f) => ids.has(f.collectionId)).map((f) => normalizeFolder({ ...f, id: ids.get(f.id), collectionId: ids.get(f.collectionId), parentId: remap(f.parentId), updatedAt: now }));
   const requests = (d.requests ?? []).map((r) => normalizeRequest({
     ...r,
-    id: uid(),
+    id: fresh(r.id),
     collectionId: remap(r.collectionId),
     folderId: remap(r.folderId),
     updatedAt: now
   }));
+  const flows = (d.flows ?? []).map((f) => ({
+    ...f,
+    id: uid(),
+    updatedAt: now,
+    nodes: f.nodes.map((n) => n.type === "request" && n.config.requestId ? { ...n, config: { ...n.config, requestId: ids.get(n.config.requestId) ?? n.config.requestId } } : n)
+  }));
   const environments = (d.environments ?? []).map((e) => ({ ...e, id: uid(), updatedAt: now }));
-  return { source: "dispatch", collections, folders, requests, environments, globals: d.globals ?? [], warnings: [] };
+  return { source: "dispatch", collections, folders, requests, environments, globals: d.globals ?? [], flows, warnings: [] };
 }
 var str2 = (v) => v == null ? "" : String(v);
 var desc = (v) => typeof v === "string" ? v : typeof v?.content === "string" ? v.content : "";
@@ -42446,188 +43176,13 @@ function parseDataFile(text, fileName = "") {
   return rows;
 }
 
-// src/core/transport.ts
-function base64ToBytes(b64) {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
-}
-function bytesToBase64(bytes) {
-  let bin = "";
-  for (let i = 0; i < bytes.length; i += 32768) bin += String.fromCharCode(...bytes.subarray(i, i + 32768));
-  return btoa(bin);
-}
-function fetchBody(p) {
-  if (p.multipart) {
-    const fd = new FormData();
-    for (const part of p.multipart) {
-      if (part.file) fd.append(part.name, new Blob([base64ToBytes(part.file.base64)], { type: part.file.type }), part.file.name || "file");
-      else fd.append(part.name, part.value ?? "");
-    }
-    return fd;
-  }
-  if (p.bodyFile) return new Blob([base64ToBytes(p.bodyFile.base64)], { type: p.bodyFile.type });
-  return p.body ?? void 0;
-}
-var SendError = class extends Error {
-};
-var textDecoder = new TextDecoder("utf-8", { fatal: true });
-function decodeBody(bytes) {
-  try {
-    const body = textDecoder.decode(bytes);
-    if (/[\x00-\x08\x0E-\x1F]/.test(body.slice(0, 2048))) return { body: "", binary: true };
-    return { body, binary: false };
-  } catch {
-    return { body: "", binary: true };
-  }
-}
-var FetchTransport = class {
-  constructor(fetchImpl = (...a) => fetch(...a)) {
-    this.fetchImpl = fetchImpl;
-  }
-  label = "Browser";
-  unrestricted = false;
-  async send(p, opts) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(new DOMException("timeout", "TimeoutError")), opts.timeoutMs);
-    const onAbort = () => ctrl.abort(opts.signal?.reason);
-    opts.signal?.addEventListener("abort", onAbort);
-    const started = performance.now();
-    try {
-      const res = await this.fetchImpl(p.url, {
-        method: p.method,
-        headers: p.headers,
-        body: fetchBody(p),
-        redirect: opts.followRedirects ? "follow" : "manual",
-        signal: ctrl.signal
-      });
-      const ttfb = performance.now();
-      const bytes = new Uint8Array(await res.arrayBuffer());
-      const end = performance.now();
-      const decoded = decodeBody(bytes);
-      return {
-        status: res.status,
-        statusText: res.statusText,
-        headers: [...res.headers.entries()],
-        ...decoded,
-        base64: decoded.binary ? bytesToBase64(bytes) : void 0,
-        size: bytes.byteLength,
-        timeMs: Math.round(end - started),
-        timings: { ttfbMs: Math.round(ttfb - started), downloadMs: Math.round(end - ttfb) }
-      };
-    } catch (e) {
-      if (ctrl.signal.aborted) {
-        const why = ctrl.signal.reason;
-        throw new SendError(why instanceof DOMException && why.name === "TimeoutError" ? `No response after ${Math.round(opts.timeoutMs / 1e3)} seconds.` : "Request cancelled.");
-      }
-      throw new SendError(
-        "The browser couldn\u2019t complete this request. Either the server is unreachable, or it doesn\u2019t allow requests from this page (CORS). The desktop app has no such limit."
-      );
-    } finally {
-      clearTimeout(timer);
-      opts.signal?.removeEventListener("abort", onAbort);
-    }
-  }
-};
-var CookieTransport = class {
-  constructor(inner, jar, enabled = () => true) {
-    this.inner = inner;
-    this.jar = jar;
-    this.enabled = enabled;
-  }
-  get label() {
-    return this.inner.label;
-  }
-  get unrestricted() {
-    return this.inner.unrestricted;
-  }
-  async send(p, opts) {
-    const on = this.enabled();
-    let req = p;
-    if (on && !p.headers.some(([k]) => k.toLowerCase() === "cookie")) {
-      const c2 = this.jar.header(p.url);
-      if (c2) req = { ...p, headers: [...p.headers, ["Cookie", c2]] };
-    }
-    const res = await this.inner.send(req, opts);
-    if (on) this.jar.store(p.url, res.headers);
-    return res;
-  }
-};
-
-// src/core/runtime.ts
-function folderChain(folders, folderId) {
-  const chain = [];
-  const seen = /* @__PURE__ */ new Set();
-  let id = folderId;
-  while (id && !seen.has(id)) {
-    seen.add(id);
-    const f = folders.find((x) => x.id === id);
-    if (!f) break;
-    chain.push(f);
-    id = f.parentId;
-  }
-  return chain;
-}
-var noChanges = () => ({ environment: null, collection: null, globals: null });
-function sendOptions(req, settings, signal) {
-  return {
-    timeoutMs: req.settings.timeoutMs ?? settings.timeoutMs,
-    followRedirects: req.settings.followRedirects ?? settings.followRedirects,
-    insecureTls: req.settings.insecureTls ?? settings.insecureTls,
-    signal,
-    proxyUrl: settings.proxyUrl,
-    proxyBypass: settings.proxyBypass,
-    clientCerts: settings.clientCerts,
-    caCerts: settings.caCerts
-  };
-}
-function prepareContext(ctx, req) {
-  return {
-    collection: ctx.collection,
-    environment: ctx.environment,
-    globals: ctx.globals,
-    folders: folderChain(ctx.folders, req.folderId),
-    data: ctx.data ?? null,
-    locals: ctx.locals ?? null
-  };
-}
-async function execute(req, ctx, transport, opts, pipeline = {}) {
-  const out = { sent: prepare(req, prepareContext(ctx, req)), response: null, error: null, tests: [], logs: [], changes: noChanges() };
-  try {
-    const finalReq = pipeline.beforeSend ? await pipeline.beforeSend(req, ctx, out) : req;
-    if (out.scriptError) throw new SendError(`Not sent: the pre-request script failed. ${out.scriptError}`);
-    let sent = prepare(finalReq, prepareContext(ctx, finalReq));
-    if (pipeline.sign) sent = await pipeline.sign(sent, finalReq, ctx, out);
-    out.sent = sent;
-    if (!sent.url) throw new SendError("Enter a URL to send the request to.");
-    try {
-      new URL(sent.url);
-    } catch {
-      throw new SendError(sent.unresolved.length ? `The URL still has {{${sent.unresolved[0]}}} in it. Pick an environment that defines it, or add it as a variable.` : "That URL isn\u2019t valid.");
-    }
-    let response = await transport.send(sent, opts);
-    if (pipeline.retry) {
-      const again = await pipeline.retry(sent, response, finalReq, ctx, (p) => transport.send(p, opts));
-      if (again) {
-        out.sent = again.sent;
-        response = again.response;
-      }
-    }
-    out.response = response;
-    if (pipeline.afterResponse) await pipeline.afterResponse(finalReq, ctx, out);
-  } catch (e) {
-    if (e instanceof Error && e.name === "SkipRequest") out.skipped = true;
-    out.error = e instanceof SendError ? e.message : `The request failed: ${e instanceof Error ? e.message : String(e)}`;
-  }
-  return out;
-}
-
 // src/core/runner.ts
+init_types();
+init_runtime();
 function collectItems(collection, folderId, folders, requests) {
   const out = [];
   const walk = (parent, path) => {
-    const reqs = requests.filter((r) => r.collectionId === collection.id && (r.folderId ?? null) === parent && r.protocol === "http").map((r) => ({ sort: r.sort, name: r.name, run: () => out.push({ request: r, path }) }));
+    const reqs = requests.filter((r) => r.collectionId === collection.id && (r.folderId ?? null) === parent && (r.protocol === "http" || r.protocol === "browser")).map((r) => ({ sort: r.sort, name: r.name, run: () => out.push({ request: r, path }) }));
     const subs = folders.filter((f) => f.collectionId === collection.id && f.parentId === parent).map((f) => ({ sort: f.sort, name: f.name, run: () => walk(f.id, `${path} / ${f.name}`) }));
     [...reqs, ...subs].sort(bySort).forEach((x) => x.run());
   };
@@ -42703,10 +43258,11 @@ async function runCollection(cfg, transport, pipeline, hooks = {}) {
       if (x.changes.globals) globals = x.changes.globals;
       const r = {
         iteration: it0,
+        label: cfg.iterationLabels?.[it0],
         index: i,
         name: item.request.name,
         path: item.path,
-        method: x.sent.method,
+        method: item.request.protocol === "browser" ? "WEB" : x.sent.method,
         url: x.sent.url,
         status: x.response?.status ?? null,
         statusText: x.response?.statusText ?? "",
@@ -42783,6 +43339,7 @@ function toJsonReport(s, name = "Dispatch run") {
 }
 
 // src/core/load.ts
+init_runtime();
 var MAX_VUS = 200;
 var MAX_DURATION_MS = 30 * 6e4;
 function percentile(sorted, p) {
@@ -42945,168 +43502,9 @@ function samplesCsv(samples) {
   return ["t_ms,latency_ms,status,ok,bytes,user,request,error", ...samples.map((s) => [Math.round(s.t), s.ms, s.status ?? "", s.ok, s.bytes, s.vu, q(s.name), q(s.error ?? "")].join(","))].join("\n") + "\n";
 }
 
-// src/core/scriptPipeline.ts
-var SCRIPT_TIMEOUT_MS = 1e4;
-var InlineEngine = class {
-  constructor(compile, timeoutMs = SCRIPT_TIMEOUT_MS) {
-    this.compile = compile;
-    this.timeoutMs = timeoutMs;
-  }
-  run(input, host) {
-    const go = Promise.all([Promise.resolve().then(() => (init_scripts(), scripts_exports)), Promise.resolve().then(() => (init_scriptLibs(), scriptLibs_exports))]).then(async ([m, l]) => m.runScript(input, host, this.compile ?? m.compileWithFunction, await l.loadLibs(l.neededLibs(input.code))));
-    let timer;
-    const timeout = new Promise((resolve) => {
-      timer = setTimeout(() => resolve({
-        tests: [],
-        logs: [{ level: "error", text: `${input.source}: script took longer than ${this.timeoutMs / 1e3} s and was stopped.`, at: Date.now(), source: input.source }],
-        vars: input.vars,
-        request: input.request,
-        skip: false,
-        error: `Script took longer than ${this.timeoutMs / 1e3} s.`
-      }), this.timeoutMs);
-    });
-    return Promise.race([go, timeout]).finally(() => clearTimeout(timer));
-  }
-};
-var SkipRequest = class extends SendError {
-  name = "SkipRequest";
-};
-var toRecord = (rows) => Object.fromEntries((rows ?? []).filter((v) => v.enabled && v.key.trim()).map((v) => [v.key.trim(), v.value]));
-function applyVars(rows, next) {
-  const seen = /* @__PURE__ */ new Set();
-  const out = [];
-  for (const r of rows) {
-    const k = r.key.trim();
-    if (!r.enabled || !k) {
-      out.push(r);
-      continue;
-    }
-    if (!(k in next)) continue;
-    seen.add(k);
-    out.push(r.value === next[k] ? r : { ...r, value: next[k] });
-  }
-  for (const [k, v] of Object.entries(next)) if (!seen.has(k)) out.push({ id: `v-${k}-${Math.random().toString(36).slice(2, 8)}`, key: k, value: v, enabled: true });
-  return out;
-}
-var sameVars = (a, b) => JSON.stringify(Object.entries(a).sort()) === JSON.stringify(Object.entries(b).sort());
-function pmRequestOf(req) {
-  const raw = ["json", "text", "xml", "html", "graphql"].includes(req.body.kind);
-  return {
-    name: req.name,
-    url: req.url,
-    method: req.method,
-    headers: req.headers.filter((h) => h.key.trim()).map((h) => ({ key: h.key, value: h.value, disabled: !h.enabled })),
-    body: { mode: raw ? req.body.kind === "graphql" ? "graphql" : "raw" : req.body.kind === "none" ? "none" : req.body.kind === "binary" ? "file" : req.body.kind === "formdata" ? "formdata" : "urlencoded", raw: raw ? req.body.text : "" }
-  };
-}
-function pmRequestOfSent(name, p) {
-  return { name, url: p.url, method: p.method, headers: p.headers.map(([key, value]) => ({ key, value })), body: { mode: p.body == null ? "none" : "raw", raw: p.body ?? "" } };
-}
-function applyPmRequest(req, before, after) {
-  if (JSON.stringify(before) === JSON.stringify(after)) return req;
-  const next = structuredClone(req);
-  if (after.url !== before.url) {
-    next.url = after.url;
-    next.params = paramsFromUrl(after.url, next.params);
-  }
-  if (after.method !== before.method && METHODS.includes(after.method)) next.method = after.method;
-  if (JSON.stringify(after.headers) !== JSON.stringify(before.headers)) {
-    next.headers = after.headers.map((h, i) => ({ id: next.headers[i]?.id ?? `h-${i}-${Date.now()}`, key: h.key, value: h.value, enabled: !h.disabled }));
-  }
-  if (after.body.raw !== before.body.raw) {
-    if (!["json", "text", "xml", "html", "graphql"].includes(next.body.kind)) next.body = { ...next.body, kind: "text" };
-    next.body = { ...next.body, text: after.body.raw };
-  }
-  return next;
-}
-function scriptPipeline(o) {
-  const host = {
-    async sendRequest(r) {
-      const method = METHODS.includes(r.method.toUpperCase()) ? r.method.toUpperCase() : "GET";
-      const p = {
-        method,
-        url: withScheme(r.url),
-        headers: r.headers.filter((h) => !h.disabled).map((h) => [h.key, h.value]),
-        body: r.body.mode === "none" ? null : r.body.raw,
-        unresolved: []
-      };
-      const res = await o.transport.send(p, o.sendOptions());
-      return { code: res.status, status: res.statusText, headers: res.headers, body: res.body, responseTime: res.timeMs, responseSize: res.size };
-    }
-  };
-  const scriptsFor = (req, ctx, phase) => {
-    const folders = folderChain(ctx.folders, req.folderId).reverse();
-    const list = [];
-    if (ctx.collection?.scripts[phase].trim()) list.push({ source: `Collection \u201C${ctx.collection.name}\u201D`, code: ctx.collection.scripts[phase] });
-    for (const f of folders) if (f.scripts[phase].trim()) list.push({ source: `Folder \u201C${f.name}\u201D`, code: f.scripts[phase] });
-    if (req.scripts[phase].trim()) list.push({ source: `Request \u201C${req.name}\u201D`, code: req.scripts[phase] });
-    return list;
-  };
-  const runPhase = async (phase, req, ctx, out, pmReq, response) => {
-    const scripts = scriptsFor(req, ctx, phase);
-    if (!scripts.length) return { request: pmReq, skip: false };
-    ctx.locals ??= /* @__PURE__ */ new Map();
-    const start = {
-      globals: toRecord(ctx.globals),
-      collection: toRecord(ctx.collection?.variables),
-      environment: toRecord(ctx.environment?.variables),
-      data: { ...ctx.data ?? {} },
-      locals: Object.fromEntries(ctx.locals)
-    };
-    let vars = start;
-    let request = pmReq;
-    let skip = false;
-    const it = o.iteration?.() ?? { iteration: 0, iterationCount: 1 };
-    for (const s of scripts) {
-      const r = await o.engine.run({ phase, source: s.source, code: s.code, request, response, vars, info: { requestName: req.name, requestId: req.id, ...it } }, host);
-      out.tests.push(...r.tests);
-      out.logs.push(...r.logs);
-      vars = r.vars;
-      request = r.request;
-      if (r.skip) skip = true;
-      if (r.nextRequest !== void 0) out.nextRequest = r.nextRequest;
-      if (r.visualizer) out.visualizer = r.visualizer;
-      if (r.error && phase === "post") out.tests.push({ name: `${s.source} script error`, passed: false, error: r.error });
-      if (r.error && phase === "pre") out.scriptError = `${s.source}: ${r.error}`;
-    }
-    if (!sameVars(start.environment, vars.environment) && ctx.environment) {
-      const variables = applyVars(ctx.environment.variables, vars.environment);
-      ctx.environment = { ...ctx.environment, variables };
-      out.changes.environment = variables;
-    }
-    if (!sameVars(start.collection, vars.collection) && ctx.collection) {
-      const variables = applyVars(ctx.collection.variables, vars.collection);
-      ctx.collection = { ...ctx.collection, variables };
-      out.changes.collection = variables;
-    }
-    if (!sameVars(start.globals, vars.globals)) {
-      ctx.globals = applyVars(ctx.globals, vars.globals);
-      out.changes.globals = ctx.globals;
-    }
-    ctx.locals = new Map(Object.entries(vars.locals));
-    return { request, skip };
-  };
-  return {
-    async beforeSend(req, ctx, out) {
-      const before = pmRequestOf(req);
-      const { request, skip } = await runPhase("pre", req, ctx, out, before, null);
-      if (skip) throw new SkipRequest("Skipped: a pre-request script called pm.execution.skipRequest().");
-      return applyPmRequest(req, before, request);
-    },
-    async afterResponse(req, ctx, out) {
-      if (!out.response) return;
-      const r = out.response;
-      await runPhase(
-        "post",
-        req,
-        ctx,
-        out,
-        pmRequestOfSent(req.name, out.sent),
-        { code: r.status, status: r.statusText, headers: r.headers, body: r.body, responseTime: r.timeMs, responseSize: r.size }
-      );
-    }
-  };
-}
+// src/cli/main.ts
+init_scriptPipeline();
+init_transport();
 
 // src/core/cookies.ts
 function parseSetCookie(header) {
@@ -43198,6 +43596,10 @@ var CookieJar = class {
 };
 
 // src/core/auth.ts
+init_runtime();
+init_prepare();
+init_vars();
+init_transport();
 var enc = new TextEncoder();
 var subtle = () => {
   const s = globalThis.crypto?.subtle;
@@ -43418,6 +43820,109 @@ function authPipeline(base, transport, sendOpts) {
   };
 }
 
+// src/core/browserPipeline.ts
+init_runtime();
+init_prepare();
+init_vars();
+init_browser();
+function browserHook(launcher, jar) {
+  return async (req, ctx, out, signal) => {
+    const scope2 = scopeFor(prepareContext(ctx, req));
+    const t0 = Date.now();
+    const r = await runBrowserSteps(req.browser, (s) => interpolate(s, scope2), launcher, signal);
+    out.logs.push(...r.logs);
+    if (!r.ok) {
+      out.error = r.error;
+    }
+    if (Object.keys(r.extracted).length) {
+      if (ctx.environment) {
+        const variables = storeExtracted(ctx.environment.variables, r.extracted);
+        ctx.environment = { ...ctx.environment, variables };
+        out.changes.environment = variables;
+      } else {
+        ctx.globals = storeExtracted(ctx.globals, r.extracted);
+        out.changes.globals = ctx.globals;
+      }
+    }
+    const j = jar?.();
+    if (j) for (const c2 of r.cookies) j.set({ host: c2.domain, name: c2.name, value: c2.value, path: c2.path || "/", secure: c2.secure, httpOnly: c2.httpOnly, expiresAt: c2.expires > 0 ? c2.expires * 1e3 : null });
+    const body = JSON.stringify({ ok: r.ok, finalUrl: r.finalUrl, extracted: Object.keys(r.extracted), cookies: r.cookies.length, steps: r.steps }, null, 2);
+    const response = { status: r.ok ? 200 : 0, statusText: r.ok ? "Logged in" : "Failed", headers: [["content-type", "application/json"]], body, binary: false, size: body.length, timeMs: Date.now() - t0 };
+    if (r.ok) out.response = response;
+    out.browser = r;
+  };
+}
+
+// src/node/browserLauncher.ts
+init_browser();
+import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+function onPath(cmd) {
+  for (const dir of (process.env.PATH ?? "").split(process.platform === "win32" ? ";" : ":")) {
+    const p = join(dir, cmd);
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+function findBrowser() {
+  if (process.env.DISPATCH_BROWSER && existsSync(process.env.DISPATCH_BROWSER)) return process.env.DISPATCH_BROWSER;
+  const list = BROWSER_CANDIDATES[process.platform === "win32" ? "windows" : process.platform === "darwin" ? "mac" : "linux"];
+  for (const c2 of list) {
+    const p = c2.includes("/") || c2.includes("\\") ? existsSync(c2) ? c2 : null : onPath(c2);
+    if (p) return p;
+  }
+  return null;
+}
+var nodeLauncher = {
+  launch: ({ path, show }) => new Promise((resolve, reject) => {
+    const exe = path || findBrowser();
+    if (!exe) {
+      reject(new Error("No Chrome or Edge found. Install one, or set its path (DISPATCH_BROWSER, or the step\u2019s browser path)."));
+      return;
+    }
+    const profile = mkdtempSync(join(tmpdir(), "dispatch-browser-"));
+    const extra = (process.env.DISPATCH_BROWSER_ARGS ?? "").split(" ").filter(Boolean);
+    const p = spawn(exe, [...extra, ...browserArgs(profile, show)], { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+    const cleanup = async () => {
+      p.kill();
+      await new Promise((r) => setTimeout(r, 200));
+      try {
+        rmSync(profile, { recursive: true, force: true });
+      } catch {
+      }
+    };
+    let buf = "";
+    const t = setTimeout(() => {
+      void cleanup();
+      reject(new Error("The browser didn\u2019t start in time."));
+    }, 15e3);
+    p.stderr.on("data", (d) => {
+      buf += d.toString();
+      const m = buf.match(/DevTools listening on (ws:\/\/\S+)/);
+      if (m) {
+        clearTimeout(t);
+        resolve({ wsUrl: m[1], close: cleanup });
+      }
+    });
+    p.on("error", (e) => {
+      clearTimeout(t);
+      void cleanup();
+      reject(new Error(`Couldn\u2019t start the browser: ${e.message}`));
+    });
+    p.on("exit", (code) => {
+      if (!buf.includes("DevTools listening")) {
+        clearTimeout(t);
+        reject(new Error(`The browser exited (${code}): ${buf.split("\n").slice(-3).join(" ")}`));
+      }
+    });
+  })
+};
+
+// src/cli/main.ts
+init_types();
+
 // src/core/format.ts
 function formatMs(ms) {
   return ms < 1e3 ? `${ms} ms` : `${(ms / 1e3).toFixed(2)} s`;
@@ -43427,6 +43932,8 @@ function formatMs(ms) {
 import { createServer } from "node:http";
 
 // src/core/mock.ts
+init_types();
+init_url();
 function mockPath(url) {
   let { base } = splitUrl(url);
   base = base.replace(/^\{\{[^}]+\}\}/, "");
@@ -43483,8 +43990,459 @@ function fillMockBody(body, params) {
   return body.replace(/\{\{\s*([^}\s]+)\s*\}\}/g, (w, n) => params[n] ?? w);
 }
 
+// src/cli/mcpServer.ts
+init_runtime();
+import { createInterface } from "node:readline";
+init_types();
+
+// src/core/flows.ts
+init_types();
+init_runtime();
+init_vars();
+init_prepare();
+init_runtime();
+
+// src/core/jsonpath.ts
+function queryJson(data, path) {
+  const tokens = tokenize(path.trim());
+  let current = [data];
+  for (const t of tokens) {
+    const next = [];
+    for (const v of current) {
+      if (t.kind === "recurse") {
+        collect(v, t.key, next);
+        continue;
+      }
+      if (v === null || typeof v !== "object") continue;
+      if (t.kind === "wild") {
+        next.push(...Array.isArray(v) ? v : Object.values(v));
+        continue;
+      }
+      if (t.kind === "slice") {
+        if (!Array.isArray(v)) continue;
+        const n = v.length;
+        const s = t.start == null ? 0 : t.start < 0 ? n + t.start : t.start;
+        const e = t.end == null ? n : t.end < 0 ? n + t.end : t.end;
+        next.push(...v.slice(s, e));
+        continue;
+      }
+      for (const k of t.keys) {
+        if (Array.isArray(v) && typeof k === "number") {
+          const i = k < 0 ? v.length + k : k;
+          if (i >= 0 && i < v.length) next.push(v[i]);
+        } else if (!Array.isArray(v) && Object.prototype.hasOwnProperty.call(v, k)) next.push(v[String(k)]);
+      }
+    }
+    current = next;
+  }
+  return current;
+}
+function collect(v, key, out) {
+  if (v === null || typeof v !== "object") return;
+  for (const [k, child] of Object.entries(v)) {
+    if (key === null || k === key) out.push(child);
+    collect(child, key, out);
+  }
+}
+function tokenize(path) {
+  const tokens = [];
+  let i = path.startsWith("$") ? 1 : 0;
+  const ident = () => {
+    const m = path.slice(i).match(/^[^.[\]\s]+/);
+    if (!m) throw new Error(`Expected a name at position ${i + 1}.`);
+    i += m[0].length;
+    return m[0];
+  };
+  while (i < path.length) {
+    if (path.startsWith("..", i)) {
+      i += 2;
+      if (path[i] === "*") {
+        i++;
+        tokens.push({ kind: "recurse", key: null });
+      } else tokens.push({ kind: "recurse", key: ident() });
+    } else if (path[i] === ".") {
+      i++;
+      if (path[i] === "*") {
+        i++;
+        tokens.push({ kind: "wild" });
+      } else tokens.push({ kind: "keys", keys: [ident()] });
+    } else if (path[i] === "[") {
+      const end = path.indexOf("]", i);
+      if (end < 0) throw new Error("Missing ].");
+      const inner = path.slice(i + 1, end).trim();
+      i = end + 1;
+      if (inner === "*") {
+        tokens.push({ kind: "wild" });
+        continue;
+      }
+      const slice = inner.match(/^(-?\d*):(-?\d*)$/);
+      if (slice) {
+        tokens.push({ kind: "slice", start: slice[1] ? Number(slice[1]) : null, end: slice[2] ? Number(slice[2]) : null });
+        continue;
+      }
+      const keys = inner.split(",").map((p) => {
+        const s = p.trim();
+        if (/^-?\d+$/.test(s)) return Number(s);
+        const q = s.match(/^(['"])(.*)\1$/);
+        if (q) return q[2];
+        throw new Error(`Couldn\u2019t read [${inner}].`);
+      });
+      tokens.push({ kind: "keys", keys });
+    } else if (i === 0 || i === 1 && path[0] === "$") {
+      tokens.push({ kind: "keys", keys: [ident()] });
+    } else throw new Error(`Unexpected \u201C${path[i]}\u201D at position ${i + 1}.`);
+  }
+  return tokens;
+}
+
+// src/core/flows.ts
+var PORTS = {
+  start: ["next"],
+  request: ["ok", "failed"],
+  script: ["next"],
+  if: ["true", "false"],
+  set: ["next"],
+  delay: ["next"],
+  forEach: ["each", "done"],
+  end: []
+};
+var MAX_STEPS = 1e4;
+var respData = (r) => r ? { code: r.status, status: r.statusText, headers: r.headers, body: r.body, responseTime: r.timeMs, responseSize: r.size } : null;
+var parseJson = (s) => {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return void 0;
+  }
+};
+function checkFlow(f, requests) {
+  const out = [];
+  const starts = f.nodes.filter((n) => n.type === "start");
+  if (starts.length !== 1) out.push("A flow needs exactly one Start block.");
+  for (const n of f.nodes) {
+    if (n.type === "request" && !requests.some((r) => r.id === n.config.requestId)) out.push(`\u201C${n.label}\u201D doesn\u2019t point at a saved request.`);
+    if (n.type === "set" && !n.config.name?.trim()) out.push(`\u201C${n.label}\u201D needs a variable name.`);
+  }
+  for (const e of f.edges) if (!f.nodes.some((n) => n.id === e.from) || !f.nodes.some((n) => n.id === e.to)) out.push("A wire points at a block that no longer exists.");
+  return out;
+}
+async function runFlow(f, w, transport, pipeline, engine, hooks = {}) {
+  const started = Date.now();
+  const sleep = hooks.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const run = { ok: true, error: null, steps: [], logs: [], environment: null, globals: w.globals, vars: {}, durationMs: 0 };
+  const problems = checkFlow(f, w.requests);
+  if (problems.length) return { ...run, ok: false, error: problems.join(" ") };
+  const locals = /* @__PURE__ */ new Map();
+  const ctx = (req) => ({
+    collection: req?.collectionId ? w.collections.find((c2) => c2.id === req.collectionId) ?? null : null,
+    folders: w.folders,
+    environment,
+    globals: run.globals,
+    locals
+  });
+  let environment = w.environment ? structuredClone(w.environment) : null;
+  let last = null;
+  let steps = 0;
+  const fill = (s) => interpolate(s, scopeFor({ ...prepareContext(ctx(null), { folderId: null }), locals }));
+  const next = (n, port) => f.edges.filter((e) => e.from === n.id && e.port === port).map((e) => f.nodes.find((x) => x.id === e.to)).filter(Boolean);
+  class Stop extends Error {
+  }
+  const script = async (code, label) => {
+    const r = await engine.run({
+      phase: "post",
+      source: `Flow \u201C${f.name}\u201D \xB7 ${label}`,
+      code,
+      response: respData(last),
+      request: { name: label, url: "", method: "GET", headers: [], body: { mode: "none", raw: "" } },
+      vars: { globals: Object.fromEntries(run.globals.filter((v) => v.enabled).map((v) => [v.key, v.value])), collection: {}, environment: Object.fromEntries((environment?.variables ?? []).filter((v) => v.enabled).map((v) => [v.key, v.value])), data: {}, locals: Object.fromEntries(locals) },
+      info: { requestName: label, requestId: "", iteration: 0, iterationCount: 1 }
+    }, { sendRequest: () => Promise.reject(new Error("pm.sendRequest isn\u2019t available in flow scripts; use a Request block.")) });
+    run.logs.push(...r.logs);
+    if (r.error) throw new Error(r.error);
+    for (const [k, v] of Object.entries(r.vars.locals)) locals.set(k, v);
+    if (environment) {
+      const { applyVars: applyVars2 } = await Promise.resolve().then(() => (init_scriptPipeline(), scriptPipeline_exports));
+      environment = { ...environment, variables: applyVars2(environment.variables, r.vars.environment) };
+    }
+    return r;
+  };
+  const visit = async (first) => {
+    for (let n = first; n; ) {
+      if (hooks.signal?.aborted) throw new Stop("Stopped.");
+      if (++steps > MAX_STEPS) throw new Stop(`Stopped after ${MAX_STEPS} steps (a loop that never ends?).`);
+      const t0 = Date.now();
+      const step = { nodeId: n.id, label: n.label, status: "running", port: null, ms: 0, detail: "" };
+      hooks.onStep?.({ ...step });
+      const finish = (status, port2, detail, extra = {}) => {
+        Object.assign(step, { status, port: port2, detail, ms: Date.now() - t0, ...extra });
+        run.steps.push({ ...step });
+        hooks.onStep?.({ ...step });
+      };
+      let port = PORTS[n.type][0] ?? null;
+      try {
+        switch (n.type) {
+          case "start":
+            finish("ok", port, "");
+            break;
+          case "request": {
+            const reqId = n.config.requestId;
+            const req = w.requests.find((r) => r.id === reqId);
+            const c2 = ctx(req);
+            const x = await execute(req, c2, transport, sendOptions(req, w.settings, hooks.signal), pipeline);
+            environment = c2.environment;
+            if (x.changes.globals) run.globals = x.changes.globals;
+            run.logs.push(...x.logs);
+            if (x.response) last = x.response;
+            const bad = !!x.error || (x.response?.status ?? 0) >= 400 || x.tests.some((t) => !t.passed);
+            port = bad ? "failed" : "ok";
+            const detail = x.error ?? `${req.protocol === "browser" ? "Browser login" : `${x.sent.method} ${x.sent.url}`} \u2192 ${x.response?.status} ${x.response?.statusText} \xB7 ${x.response?.timeMs} ms${x.tests.length ? ` \xB7 ${x.tests.filter((t) => t.passed).length}/${x.tests.length} tests` : ""}`;
+            finish(bad ? "failed" : "ok", port, detail, { status_code: x.response?.status, tests: x.tests });
+            if (bad && !next(n, "failed").length) throw new Stop(`${n.label} failed: ${detail}`);
+            break;
+          }
+          case "script":
+            await script(n.config.code ?? "", n.label);
+            finish("ok", port, "done");
+            break;
+          case "if": {
+            const expr = (n.config.expression ?? "").trim() || "false";
+            await script(`const response = pm.response ? { code: pm.response.code, status: pm.response.status, headers: pm.response.headers.toObject(), body: pm.response.text(), json: (() => { try { return pm.response.json() } catch { return undefined } })() } : null
+            const vars = pm.variables.toObject()
+            pm.variables.set('__flowIf', (${expr}) ? 'true' : 'false')`, n.label);
+            port = locals.get("__flowIf") === "true" ? "true" : "false";
+            locals.delete("__flowIf");
+            finish("ok", port, `${expr} \u2192 ${port}`);
+            break;
+          }
+          case "set": {
+            const name = n.config.name.trim();
+            let value = n.config.value ?? "";
+            if (value.trim().startsWith("$")) {
+              const data = last ? parseJson(last.body) : void 0;
+              const hit = data === void 0 ? [] : queryJson(data, value.trim());
+              value = hit.length === 0 ? "" : typeof hit[0] === "string" ? hit[0] : JSON.stringify(hit[0]);
+            } else value = fill(value);
+            if (n.config.scope === "environment" && environment) {
+              const vars = environment.variables.some((v) => v.key === name) ? environment.variables.map((v) => v.key === name ? { ...v, value } : v) : [...environment.variables, { id: uid(), key: name, value, enabled: true }];
+              environment = { ...environment, variables: vars };
+            } else locals.set(name, value);
+            finish("ok", port, `{{${name}}} = ${value.length > 60 ? `${value.slice(0, 60)}\u2026` : value}`);
+            break;
+          }
+          case "delay": {
+            const ms = Math.min(6e5, Number(fill(n.config.ms ?? "0")) || 0);
+            await sleep(ms);
+            finish("ok", port, `${ms} ms`);
+            break;
+          }
+          case "forEach": {
+            let items = [];
+            if (n.config.source === "data") items = parseDataFile(fill(n.config.items ?? ""));
+            else {
+              const data = last ? parseJson(last.body) : void 0;
+              items = data === void 0 ? [] : queryJson(data, n.config.path || "$[*]");
+            }
+            const as = n.config.as?.trim() || "item";
+            finish("ok", "each", `${items.length} item${items.length === 1 ? "" : "s"}`);
+            for (let i = 0; i < items.length; i++) {
+              const it = items[i];
+              locals.set(as, typeof it === "string" ? it : JSON.stringify(it));
+              locals.set(`${as}Index`, String(i));
+              if (it && typeof it === "object" && !Array.isArray(it)) for (const [k, v] of Object.entries(it)) locals.set(`${as}.${k}`, typeof v === "string" ? v : JSON.stringify(v));
+              for (const m of next(n, "each")) await visit(m);
+            }
+            for (const m of next(n, "done")) await visit(m);
+            port = null;
+            break;
+          }
+          case "end":
+            finish(n.config.outcome === "fail" ? "failed" : "ok", null, n.config.outcome === "fail" ? "Ended as failed" : "Ended");
+            if (n.config.outcome === "fail") {
+              run.ok = false;
+              run.error = run.error ?? `${n.label}: ended as failed.`;
+            }
+            throw new EndFlow();
+        }
+      } catch (e) {
+        if (e instanceof EndFlow || e instanceof Stop) throw e;
+        finish("failed", null, e instanceof Error ? e.message : String(e));
+        throw new Stop(`${n.label}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      const nexts = port ? next(n, port) : [];
+      if (nexts.length === 1) {
+        n = nexts[0];
+        continue;
+      }
+      for (const m of nexts) await visit(m);
+      n = null;
+    }
+  };
+  try {
+    await visit(f.nodes.find((n) => n.type === "start"));
+  } catch (e) {
+    if (!(e instanceof EndFlow)) {
+      run.ok = false;
+      run.error = e instanceof Error ? e.message : String(e);
+    }
+  }
+  run.environment = environment?.variables ?? null;
+  run.vars = Object.fromEntries(locals);
+  run.durationMs = Date.now() - started;
+  return run;
+}
+var EndFlow = class extends Error {
+};
+
+// src/cli/mcpServer.ts
+var BODY_LIMIT = 2e4;
+function mcpTools(flowNames = []) {
+  return [
+    {
+      name: "list_requests",
+      description: "List the saved requests in this collection: their names, folders, methods and URLs (with {{variables}}).",
+      inputSchema: { type: "object", properties: {} }
+    },
+    {
+      name: "send_request",
+      description: "Send one saved request (with its auth, scripts and tests) and return the status, headers, body and test results.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: 'The request name, or "Folder/Sub/Request" when names repeat.' },
+          variables: { type: "object", additionalProperties: { type: "string" }, description: "Values for {{variables}}, overriding the environment for this call." }
+        },
+        required: ["name"]
+      }
+    },
+    {
+      name: "run_collection",
+      description: "Run every request in the collection (or one folder) in order, with tests, and return a summary with any failures.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          folder: { type: "string", description: 'A folder path like "Orders/Admin"; leave out for the whole collection.' },
+          data: { type: "array", items: { type: "object" }, description: "Optional data rows: one run per row, the keys become {{variables}}." }
+        }
+      }
+    },
+    ...flowNames.length ? [{
+      name: "run_flow",
+      description: `Run a flow (requests chained with conditions and loops) and return each step. Flows: ${flowNames.join(", ")}.`,
+      inputSchema: { type: "object", properties: { name: { type: "string", enum: flowNames, description: "The flow to run." } }, required: ["name"] }
+    }] : []
+  ];
+}
+async function handleMcp(msg, o) {
+  const reply = (result) => ({ jsonrpc: "2.0", id: msg.id, result });
+  const fail = (code, message) => ({ jsonrpc: "2.0", id: msg.id, error: { code, message } });
+  const text = (t, isError = false) => reply({ content: [{ type: "text", text: t }], ...isError ? { isError: true } : {} });
+  if (msg.id === void 0) return null;
+  const col = o.ws.collections[0];
+  const items = () => col ? collectItems(col, null, o.ws.folders, o.ws.requests) : [];
+  const pathOf2 = (it) => [...it.path.split(" / ").slice(1), it.request.name].join("/");
+  switch (msg.method) {
+    case "initialize":
+      return reply({
+        protocolVersion: msg.params?.protocolVersion ?? "2025-06-18",
+        capabilities: { tools: {} },
+        serverInfo: { name: "dispatch", version: o.version },
+        instructions: `Requests from the Dispatch collection \u201C${col?.name ?? "(none)"}\u201D${o.environment ? ` with environment \u201C${o.environment.name}\u201D` : ""}. Use list_requests to see what's there.`
+      });
+    case "ping":
+      return reply({});
+    case "tools/list":
+      return reply({ tools: mcpTools(o.engine ? (o.ws.flows ?? []).map((f) => f.name) : []) });
+    case "tools/call": {
+      const name = msg.params?.name;
+      const args = msg.params?.arguments ?? {};
+      if (name === "list_requests") {
+        const list = items().map((it) => `${it.request.method.padEnd(6)} ${pathOf2(it)}  ${it.request.url}`);
+        return text(list.length ? list.join("\n") : "No requests.");
+      }
+      if (name === "send_request") {
+        const want = String(args.name ?? "");
+        const all = items();
+        const it = all.find((x2) => pathOf2(x2) === want) ?? all.find((x2) => x2.request.name === want);
+        if (!it) return text(`No request named \u201C${want}\u201D. Use list_requests.`, true);
+        if (o.allowMethods.length && !o.allowMethods.includes(it.request.method)) return text(`${it.request.method} requests aren\u2019t allowed here (allowed: ${o.allowMethods.join(", ")}).`, true);
+        const locals = new Map(Object.entries(args.variables ?? {}).map(([k, v]) => [k, String(v)]));
+        const x = await execute(it.request, { collection: col, folders: o.ws.folders, environment: o.environment, globals: o.globals, locals }, o.transport, sendOptions(it.request, o.settings), o.pipeline);
+        if (x.error && !x.response) return text(`Not sent: ${x.error}`, true);
+        const r = x.response;
+        const body = r.binary ? `(binary, ${r.size} bytes)` : r.body.length > BODY_LIMIT ? `${r.body.slice(0, BODY_LIMIT)}
+\u2026 (cut at ${BODY_LIMIT} characters)` : r.body;
+        const tests = x.tests.length ? `
+
+Tests:
+${x.tests.map((t) => `${t.passed ? "\u2713" : "\u2717"} ${t.name}${t.error ? ` \u2014 ${t.error}` : ""}`).join("\n")}` : "";
+        return text(`${x.sent.method} ${x.sent.url}
+\u2192 ${r.status} ${r.statusText} (${r.timeMs} ms)
+${r.headers.map(([k, v]) => `${k}: ${v}`).join("\n")}
+
+${body}${tests}`, r.status >= 400 || x.tests.some((t) => !t.passed));
+      }
+      if (name === "run_collection") {
+        let list = items();
+        if (args.folder) {
+          const prefix = `${String(args.folder).replace(/^\/|\/$/g, "")}/`;
+          list = list.filter((x) => pathOf2(x).startsWith(prefix));
+          if (!list.length) return text(`No folder \u201C${args.folder}\u201D.`, true);
+        }
+        if (o.allowMethods.length) {
+          const blocked = list.filter((x) => !o.allowMethods.includes(x.request.method));
+          if (blocked.length) return text(`This run includes ${blocked.map((b) => `${b.request.method} ${b.request.name}`).join(", ")}, which aren\u2019t allowed here.`, true);
+        }
+        const data = Array.isArray(args.data) ? args.data.map((row) => Object.fromEntries(Object.entries(row).map(([k, v]) => [k, typeof v === "string" ? v : JSON.stringify(v)]))) : null;
+        const s = await runCollection({ items: list, iterations: data ? 0 : 1, data, delayMs: 0, stopOnFailure: false, environment: o.environment, collections: o.ws.collections, folders: o.ws.folders, globals: o.globals, settings: o.settings }, o.transport, o.pipeline);
+        const bad = s.results.filter(failed);
+        return text([
+          `${s.requests} requests in ${s.iterations} iteration(s): ${s.testsPassed} tests passed, ${s.testsFailed} failed, ${s.failedRequests} errors, avg ${s.avgTimeMs} ms.`,
+          ...bad.slice(0, 20).map((r) => `\u2717 ${r.name}: ${r.error ?? r.tests.filter((t) => !t.passed).map((t) => `${t.name}: ${t.error ?? "failed"}`).join("; ")}`)
+        ].join("\n"), bad.length > 0);
+      }
+      if (name === "run_flow" && o.engine) {
+        const f = (o.ws.flows ?? []).find((x) => x.name === args.name);
+        if (!f) return text(`No flow named \u201C${args.name}\u201D.`, true);
+        if (o.allowMethods.length) {
+          const blocked = f.nodes.flatMap((n) => n.type === "request" ? o.ws.requests.filter((r2) => r2.id === n.config.requestId && !o.allowMethods.includes(r2.method)) : []);
+          if (blocked.length) return text(`This flow sends ${blocked.map((b) => `${b.method} ${b.name}`).join(", ")}, which aren\u2019t allowed here.`, true);
+        }
+        const r = await runFlow(f, { collections: o.ws.collections, folders: o.ws.folders, requests: o.ws.requests, environment: o.environment, globals: o.globals, settings: o.settings }, o.transport, o.pipeline, o.engine);
+        return text([
+          `${r.ok ? "Passed" : `Failed: ${r.error}`} (${r.steps.length} steps, ${r.durationMs} ms)`,
+          ...r.steps.filter((x) => x.status !== "running").slice(0, 100).map((x) => `${x.status === "ok" ? "\u2713" : x.status === "failed" ? "\u2717" : "\xB7"} ${x.label}${x.status_code !== void 0 ? ` ${x.status_code}` : ""}${x.port ? ` \u2192 ${x.port}` : ""} ${x.detail}`)
+        ].join("\n"), !r.ok);
+      }
+      return fail(-32602, `Unknown tool ${name}`);
+    }
+    default:
+      return fail(-32601, `Method not found: ${msg.method}`);
+  }
+}
+function serveMcp(o) {
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: process.stdin });
+    const write = (m) => process.stdout.write(`${JSON.stringify(m)}
+`);
+    rl.on("line", (line) => {
+      if (!line.trim()) return;
+      let msg;
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        write({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
+        return;
+      }
+      void handleMcp(msg, o).then((r) => {
+        if (r) write(r);
+      }, (e) => write({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: e instanceof Error ? e.message : String(e) } }));
+    });
+    rl.on("close", () => resolve());
+  });
+}
+
 // src/cli/main.ts
-var VERSION = "0.3.0";
+var VERSION = "0.4.2";
 var color = process.stdout.isTTY && !process.env.NO_COLOR;
 var c = (code) => (s) => color ? `\x1B[${code}m${s}\x1B[0m` : s;
 var green = c(32);
@@ -43498,6 +44456,8 @@ Usage:
   dispatch-run <file|folder> [options]   run a collection (Dispatch backup, Postman/Insomnia file, or a collection folder)
   dispatch-run load <file> [options]     load-test a request or a collection
   dispatch-run mock <file> [options]     serve a collection's saved examples (mock server)
+  dispatch-run mcp <file|folder> [opts]  serve a collection to AI assistants over MCP (stdio)
+  dispatch-run flow <file> [options]     run a flow from a Dispatch backup/export
 
 Run options:
   -c, --collection <name>      collection to run (default: the only/first one)
@@ -43529,9 +44489,17 @@ Load options:
       --samples <path>         write every sample as CSV
       --i-have-permission      required: you own the server or may load-test it
 
+Flow options (also -e, -g, --env-var, -k, --timeout, --json from above):
+      --flow <name>            flow to run (default: the only/first one)
+
 Mock options:
       --port <n>               port to listen on (default 4319, 127.0.0.1 only)
       --delay <ms>             wait before each response
+
+MCP options (also -e, --env-var, -g, -k, --timeout from above):
+      --allow-methods <list>   methods assistants may send, e.g. GET,HEAD (default: all)
+  Add to an assistant, e.g. Claude Code:
+      claude mcp add dispatch -- dispatch-run mcp ./my-collection -e Prod
 
 Exit code: 0 when everything passed, 1 when a test, request or threshold failed, 2 for usage errors.
 `;
@@ -43591,10 +44559,10 @@ async function loadWorkspace(file) {
       const walk = (dir) => {
         for (const e of readdirSync(dir, { withFileTypes: true })) {
           if (e.isDirectory()) {
-            if (e.name !== ".git" && e.name !== "node_modules") walk(join(dir, e.name));
+            if (e.name !== ".git" && e.name !== "node_modules") walk(join2(dir, e.name));
             continue;
           }
-          if (/(\.req\.yaml|_folder\.yaml|dispatch\.collection\.yaml)$/.test(e.name)) files.push({ path: relative(file, join(dir, e.name)).replace(/\\/g, "/"), text: readFileSync(join(dir, e.name), "utf8") });
+          if (/(\.req\.yaml|_folder\.yaml|dispatch\.collection\.yaml)$/.test(e.name)) files.push({ path: relative(file, join2(dir, e.name)).replace(/\\/g, "/"), text: readFileSync(join2(dir, e.name), "utf8") });
         }
       };
       walk(file);
@@ -43640,7 +44608,9 @@ async function main(argv) {
   }
   const isLoad = pos[0] === "load";
   const isMock = pos[0] === "mock";
-  const file = isLoad || isMock ? pos[1] : pos[0];
+  const isMcp = pos[0] === "mcp";
+  const isFlow = pos[0] === "flow";
+  const file = isLoad || isMock || isMcp || isFlow ? pos[1] : pos[0];
   if (!file) throw new Usage("Give a collection file.");
   const ws = await loadWorkspace(file);
   for (const w of ws.warnings) console.error(yellow(`note: ${w}`));
@@ -43698,7 +44668,49 @@ async function main(argv) {
   const settings = { ...defaultSettings, timeoutMs: int2(one(opts, "timeout"), "timeout", 3e4), insecureTls: !!opts.insecure };
   const transport = new CookieTransport(new FetchTransport(), new CookieJar());
   const scripts = opts["no-scripts"] ? {} : scriptPipeline({ engine: new InlineEngine(compileInVm), transport, sendOptions: () => ({ timeoutMs: settings.timeoutMs, followRedirects: true, insecureTls: settings.insecureTls }) });
-  const pipeline = authPipeline(scripts, transport);
+  const pipeline = { ...authPipeline(scripts, transport), browser: browserHook(nodeLauncher, () => transport.jar) };
+  if (isMcp) {
+    console.error(`dispatch-run ${VERSION}: serving ${ws.collections[0]?.name ?? file} over MCP (stdio)`);
+    await serveMcp({
+      ws: { ...ws, collections: one(opts, "collection") ? ws.collections.filter((c2) => c2.name === one(opts, "collection")) : ws.collections },
+      environment,
+      globals,
+      settings,
+      transport,
+      pipeline,
+      version: VERSION,
+      engine: new InlineEngine(compileInVm),
+      allowMethods: (one(opts, "allow-methods") ?? "").split(",").map((m) => m.trim().toUpperCase()).filter(Boolean)
+    });
+    return 0;
+  }
+  if (isFlow) {
+    const name2 = one(opts, "flow");
+    const flows = ws.flows ?? [];
+    const flow = name2 ? flows.find((f) => f.name === name2) : flows[0];
+    if (!flow) throw new Usage(name2 ? `No flow named "${name2}"${flows.length ? ` (have: ${flows.map((f) => f.name).join(", ")})` : ""}.` : "The file has no flows (export a workspace or backup from Dispatch).");
+    console.log(bold(`Flow: ${flow.name}`));
+    const r = await runFlow(
+      flow,
+      { collections: ws.collections, folders: ws.folders, requests: ws.requests, environment, globals, settings },
+      transport,
+      pipeline,
+      new InlineEngine(compileInVm),
+      {
+        onStep: (s) => {
+          if (s.status === "running") return;
+          const mark = s.status === "ok" ? green("\u2713") : s.status === "failed" ? red("\u2717") : dim("\xB7");
+          console.log(`${mark} ${s.label}${s.status_code !== void 0 ? ` ${s.status_code < 400 ? green(String(s.status_code)) : red(String(s.status_code))}` : ""}${s.port ? dim(` \u2192 ${s.port}`) : ""}  ${dim(s.detail)}`);
+          for (const t of s.tests ?? []) console.log(t.passed ? `    ${green("\u2713")} ${t.name}` : `    ${red("\u2717")} ${t.name}${t.error ? red(` \u2014 ${t.error}`) : ""}`);
+        }
+      }
+    );
+    for (const l of r.logs.filter((x) => x.level === "warn" || x.level === "error")) console.log(dim(`  ${l.level}: ${l.text}`));
+    if (one(opts, "json")) writeFileSync(one(opts, "json"), JSON.stringify({ flow: flow.name, ok: r.ok, error: r.error, durationMs: r.durationMs, steps: r.steps }, null, 2));
+    console.log(`
+${r.ok ? green(bold("Passed")) : red(bold("Failed"))}  ${r.steps.length} steps, ${formatMs(r.durationMs)}${r.error ? red(`  ${r.error}`) : ""}`);
+    return r.ok ? 0 : 1;
+  }
   let items = selectItems(ws, one(opts, "collection"), opts.folder);
   if (!items.length) throw new Usage("Nothing to run: no HTTP requests found.");
   if (isLoad) {

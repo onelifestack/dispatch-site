@@ -28,6 +28,7 @@
 <p>Secret variables, passwords, tokens, keys, and Authorization and Cookie headers are encrypted before they are saved, using a key that stays on the device and cannot be exported. Exports and backups you download leave secrets out.</p>
 <h2>Requests you send</h2>
 <p>When you press Send, Dispatch sends that request to the address you typed, with the headers and body you set. That is the only network traffic Dispatch makes. What the other server does with it is up to that server. Scripts you write can send requests too (<code>pm.sendRequest</code>), to the places you tell them to.</p>
+<p>A Browser login request opens your installed Chrome or Edge with a new, empty profile that is deleted afterwards, with sync and background networking turned off. It visits the pages in your steps. The values it keeps, such as cookies or a token, are stored as secret variables on this device.</p>
 <h2>What Dispatch does not do</h2>
 <ul><li>No account, sign-in or sync.</li><li>No analytics, telemetry or crash reporting.</li><li>No update check. Dispatch does not contact us or anyone else on its own.</li><li>No advertising and no trackers.</li><li>No fonts, scripts or images loaded from other sites, in the app or on this website.</li></ul>
 <h2>The web app and this website</h2>
