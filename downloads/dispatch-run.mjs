@@ -44442,7 +44442,7 @@ function serveMcp(o) {
 }
 
 // src/cli/main.ts
-var VERSION = "0.5.0";
+var VERSION = "0.5.1";
 var color = process.stdout.isTTY && !process.env.NO_COLOR;
 var c = (code) => (s) => color ? `\x1B[${code}m${s}\x1B[0m` : s;
 var green = c(32);
