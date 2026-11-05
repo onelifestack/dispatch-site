@@ -43768,8 +43768,8 @@ async function tokenRequest(a, params, transport, opts) {
     raw: json
   };
 }
-function refreshToken(a, t, o) {
-  return tokenRequest(a, { grant_type: "refresh_token", refresh_token: a.refreshToken }, t, o);
+function refreshToken(a, t, o, extra = {}) {
+  return tokenRequest(a, { grant_type: "refresh_token", refresh_token: a.refreshToken, ...extra }, t, o);
 }
 function authPipeline(base, transport, sendOpts) {
   const resolved = (req, ctx) => {
@@ -44442,7 +44442,7 @@ function serveMcp(o) {
 }
 
 // src/cli/main.ts
-var VERSION = "0.4.2";
+var VERSION = "0.5.0";
 var color = process.stdout.isTTY && !process.env.NO_COLOR;
 var c = (code) => (s) => color ? `\x1B[${code}m${s}\x1B[0m` : s;
 var green = c(32);
